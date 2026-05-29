@@ -222,9 +222,9 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
      */
     private function userCreate(UserService $user_service, array $params): ResponseInterface
     {
-        $user_name = $this->clean((string) ($params['user_name'] ?? ''));
-        $real_name = $this->clean((string) ($params['real_name'] ?? ''));
-        $email     = $this->clean((string) ($params['email'] ?? ''));
+        $user_name = $this->cleanLine((string) ($params['user_name'] ?? ''));
+        $real_name = $this->cleanLine((string) ($params['real_name'] ?? ''));
+        $email     = $this->cleanLine((string) ($params['email'] ?? ''));
         $password  = (string) ($params['password'] ?? bin2hex(random_bytes(12)));
 
         if ($user_name === '' || $real_name === '' || $email === '') {
@@ -509,9 +509,9 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
         }
 
         $changed = [];
-        if (isset($params['real_name'])) { $user->setRealName($this->clean((string) $params['real_name'])); $changed[] = 'real_name'; }
-        if (isset($params['email']))     { $user->setEmail($this->clean((string) $params['email'])); $changed[] = 'email'; }
-        if (isset($params['user_name'])) { $user->setUserName($this->clean((string) $params['user_name'])); $changed[] = 'user_name'; }
+        if (isset($params['real_name'])) { $user->setRealName($this->cleanLine((string) $params['real_name'])); $changed[] = 'real_name'; }
+        if (isset($params['email']))     { $user->setEmail($this->cleanLine((string) $params['email'])); $changed[] = 'email'; }
+        if (isset($params['user_name'])) { $user->setUserName($this->cleanLine((string) $params['user_name'])); $changed[] = 'user_name'; }
         if (isset($params['password']))  { $user->setPassword((string) $params['password']); $changed[] = 'password'; }
         if (isset($params['verified']))          { $user->setPreference('verified', ((string) $params['verified']) === '1' ? '1' : '0'); $changed[] = 'verified'; }
         if (isset($params['verified_by_admin'])) { $user->setPreference('verified_by_admin', ((string) $params['verified_by_admin']) === '1' ? '1' : '0'); $changed[] = 'verified_by_admin'; }
@@ -705,10 +705,19 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
 
     /**
      * Strip characters that could break GEDCOM line structure / XREF pointers.
+     * Use for anything written into GEDCOM (names, places, facts).
      */
     private function clean(string $value): string
     {
         return trim(str_replace(["\r", "\n", "\t", '@'], ' ', $value));
+    }
+
+    /**
+     * Strip line breaks only (keeps '@'). Use for user fields like email.
+     */
+    private function cleanLine(string $value): string
+    {
+        return trim(str_replace(["\r", "\n", "\t"], ' ', $value));
     }
 
     /**
