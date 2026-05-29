@@ -1,52 +1,223 @@
 # webtrees_api
 
-A small, token-authenticated **JSON API** module for [webtrees](https://webtrees.net) 2.x,
-used to manage users and individuals on a family tree programmatically. webtrees has no
-native write API; this wraps webtrees' own internal services (`UserService`, `Tree::createIndividual`
-/ `createFamily`, `PendingChangesService`) so the search indexes and change-log stay consistent.
+A small, **token-authenticated JSON API** for [webtrees](https://webtrees.net) 2.x that lets you
+manage **users** and **individuals/families** programmatically — create and edit people, link
+spouses / children / parents, add events, and administer user accounts.
 
-> ⚠️ **No secrets in this repo.** The API token and the "run as" user id are stored in the
-> webtrees module preferences (database), not in code.
+webtrees has no built-in write API. This module wraps webtrees' **own internal services**
+(`UserService`, `Tree::createIndividual`/`createFamily`, `GedcomRecord::createFact`/`updateFact`,
+`PendingChangesService`) so that the name index (`wt_name`), link index (`wt_link`) and the
+change-log all stay correct — exactly as if you'd edited through the web UI. Every change is
+**force-accepted**, so it goes live immediately rather than sitting in the pending-changes queue.
 
-## Install
-1. Copy this folder to `modules_v4/api/` on the webtrees server (deploy disabled-first as
-   `api.disabled`, `php -l`, then rename to enable).
-2. Set the preferences in the database (`wt_module_setting`, `module_name` = `_api_`):
-   - `api_token` — a long random secret (required; no token ⇒ all requests get 403).
-   - `run_as_user_id` — a manager/admin user id, so the API can read/write a private tree.
+> ⚠️ **Security:** there are **no secrets in this repository**. The API token and the "run as"
+> user id are stored in the webtrees database (module settings), never in code. Treat the token
+> like a password and only call the API over HTTPS.
 
-## Endpoint
-`GET`/`POST` `/abf-api` — params via query string, JSON body, or form. Auth via `token`
-param or `X-Api-Token` header. Responses are JSON (`{"ok":true,...}` / `{"ok":false,"error":...}`).
-Optional `tree` param (defaults to the configured tree).
+---
 
-### Operations (`op=`)
-| op | params | does |
-|---|---|---|
-| `ping` | — | health check; echoes tree + acting user |
-| `user.lookup` | `user_id` \| `email` \| `user_name` | return a user + their tree link/role |
-| `user.activate` | `user_id`, `xref`, `role`=edit | verify + admin-approve + link individual + set role |
-| `user.create` | `user_name`, `real_name`, `email`, `password?` | create a user |
-| `user.delete` | `user_id` | delete a user (refuses site admins) |
-| `individual.get` | `xref` | return an individual |
-| `individual.create` | `given_name`, `surname`, `sex`=M/F/U, `birth_date?`, `birth_place?` | create an individual |
-| `individual.addSpouse` | `xref` (existing) + (`spouse_xref` \| `given_name`,`surname`,`sex`) | create/link a spouse, build the family, link both ways |
-| `individual.addChild` | `parent_xref` + `given_name`,`surname`,`sex` (+ `family_xref?`) | add a child (to the parent's couple-family, a named family, or a new one) |
-| `individual.update` | `xref` + any of `new_given`,`new_surname`,`sex`,`birth_date`,`birth_place`,`death_date`,`death_place`,`occupation`,`note` | rename + add/replace facts |
-| `individual.delete` | `xref` | delete a family-less individual (test cleanup) |
-| `user.update` | `user_id` + any of `real_name`,`email`,`user_name`,`password`,`role`,`verified`,`verified_by_admin`,`gedcomid` | change user fields |
-| `user.list` | `filter`=all\|unverified\|unlinked, `limit?` | list users |
+## Requirements
 
-### Example
+- webtrees **2.1.x or 2.2.x** (tested on 2.1.x).
+- Access to the webtrees server filesystem (to install the module) and to its database (to set
+  the token). A MySQL/MariaDB client, or phpMyAdmin, is enough.
+
+---
+
+## 1. Install the module
+
+webtrees loads **every enabled module on every request**, so a broken module file can take the
+whole site down. Install **disabled-first** to stay safe:
+
+1. Copy this folder into your webtrees `modules_v4/` directory, but name it with a dot so webtrees
+   ignores it at first:
+
+   ```
+   modules_v4/api.disabled/
+     ├── module.php
+     ├── ApiModule.php
+     └── README.md
+   ```
+
+   (Download the repo, or `git clone https://github.com/jbh4x82/webtrees_api modules_v4/api.disabled`.)
+
+2. Lint the files on the server to be sure they parse:
+
+   ```bash
+   php -l modules_v4/api.disabled/module.php
+   php -l modules_v4/api.disabled/ApiModule.php
+   ```
+
+3. Enable it by removing the dot (webtrees ignores any folder whose name contains `.`):
+
+   ```bash
+   mv modules_v4/api.disabled modules_v4/api
+   ```
+
+4. Open your site's home page. If it still loads, you're good. **Kill switch** if anything breaks:
+   `mv modules_v4/api modules_v4/api.disabled` and the site recovers instantly.
+
+The **module name** webtrees uses internally is `_` + folder name + `_`. So a folder called `api`
+⇒ module name **`_api_`**. (Remember this for the settings below; if you rename the folder, the
+module name changes.)
+
+5. In webtrees, go to **Control panel → Modules** and make sure the module is enabled.
+
+---
+
+## 2. Configure the token (required)
+
+The API refuses every request (HTTP 403) until you set a token. Settings live in the
+`module_setting` table. **Use your own table prefix** (default `wt_`, see `tblpfx` in
+`data/config.ini.php`) and the module name from step 1 (`_api_`).
+
+Generate a long random token, e.g.:
+
 ```bash
-curl -s "https://<host>/index.php?route=/abf-api&op=ping&token=$TOKEN"
-curl -s "https://<host>/index.php?route=/abf-api" \
-  -H "X-Api-Token: $TOKEN" -H 'content-type: application/json' \
-  -d '{"op":"individual.addSpouse","xref":"I353","given_name":"Vincenz","surname":"Waldstein-Wartenberg","sex":"M"}'
+openssl rand -hex 24
 ```
 
-## Notes
+Then insert two settings:
+
+```sql
+-- replace wt_ with your table prefix, and paste your generated token
+INSERT INTO wt_module_setting (module_name, setting_name, setting_value) VALUES
+  ('_api_', 'api_token', 'PASTE_YOUR_LONG_RANDOM_TOKEN_HERE'),
+  ('_api_', 'run_as_user_id', '1')
+ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value);
+```
+
+- **`api_token`** — the shared secret. No token configured ⇒ all requests get `403 forbidden`.
+- **`run_as_user_id`** — the webtrees **user id the API acts as**. Set this to a **tree manager
+  or administrator** (find ids in **Control panel → Users**, or `SELECT user_id, user_name FROM
+  wt_user`). This is essential for a **private tree**: the API runs unauthenticated, so without a
+  privileged "run as" user, webtrees privacy would hide all data and block writes.
+- Optional **`tree`** setting overrides which tree the API works on; otherwise it uses the first
+  argument-less default (`meran.ged` in the bundled copy — change `DEFAULT_TREE` in `ApiModule.php`
+  or pass `&tree=yourtree.ged` per request).
+
+To retrieve the token later: `SELECT setting_value FROM wt_module_setting WHERE module_name='_api_'
+AND setting_name='api_token';`
+
+---
+
+## 3. Call the API
+
+- **Endpoint:** `https://YOUR_SITE/index.php?route=/abf-api` (or `https://YOUR_SITE/abf-api` if you
+  have pretty-URLs enabled).
+- **Method: GET.** (webtrees' CSRF protection blocks POST without a session token, so this API is
+  GET-only.) Pass parameters as query-string values.
+- **Auth:** add `token=YOUR_TOKEN` as a parameter, or send an `X-Api-Token: YOUR_TOKEN` header.
+- **Responses:** JSON. Success → `{"ok": true, ...}`; failure → `{"ok": false, "error": "..."}`.
+- **Tree:** optional `tree=NAME.ged` to target a specific tree.
+
+Always URL-encode values (spaces, umlauts, etc.). With `curl`:
+
+```bash
+SITE="https://your.tree.example"; TOKEN="your-token"
+api() { curl -s -G "$SITE/index.php" --data-urlencode "route=/abf-api" \
+        --data-urlencode "token=$TOKEN" "$@"; }
+
+api --data-urlencode "op=ping"
+```
+
+---
+
+## 4. Operations
+
+Every call needs `op=<operation>` plus the params below. `?` marks optional params.
+
+### Read
+| op | params | returns |
+|---|---|---|
+| `ping` | — | health check (tree + acting user) |
+| `individual.get` | `xref` | xref, name, sex, spouse-families |
+| `family.get` | `xref` | husband, wife, children |
+| `user.lookup` | `user_id` \| `email` \| `user_name` | user + tree role/link |
+| `user.list` | `filter`=`all`\|`unverified`\|`unlinked`, `limit?` | list of users |
+
+### Individuals
+| op | params | does |
+|---|---|---|
+| `individual.create` | `given_name`, `surname`, `sex`=`M`/`F`/`U`, `birth_date?`, `birth_place?` | create a person |
+| `individual.update` | `xref` + any of `new_given`, `new_surname`, `sex`, `birth_date`, `birth_place`, `death_date`, `death_place`, `occupation`, `note` | rename + add/replace facts |
+| `individual.addFact` | `xref`, `tag` (e.g. `RESI`,`BAPM`,`EDUC`), `value?`, `date?`, `place?` | add an arbitrary fact |
+| `individual.delete` | `xref` | delete a person **with no family links** (safety guard) |
+
+### Relationships (create the person + wire the family both ways)
+| op | params | does |
+|---|---|---|
+| `individual.addSpouse` | `xref` (existing) + (`spouse_xref` \| `given_name`,`surname`,`sex`) | add/link a spouse |
+| `individual.addChild` | `parent_xref` + `given_name`,`surname`,`sex` (+ `family_xref?`) | add a child |
+| `individual.addParent` | `xref` (child) + (`parent_xref` \| `given_name`,`surname`,`sex`) (+ `family_xref?`) | add a father/mother |
+
+### Families
+| op | params | does |
+|---|---|---|
+| `family.addEvent` | `family_xref`, `tag?`(=`MARR`), `date?`, `place?`, `value?` | add a marriage/other family event |
+
+### Users (admin)
+| op | params | does |
+|---|---|---|
+| `user.create` | `user_name`, `real_name`, `email`, `password?` | create a user (random password if omitted) |
+| `user.activate` | `user_id`, `xref?`, `role?`=`edit` | verify + admin-approve + link to an individual + set role |
+| `user.update` | `user_id` + any of `real_name`, `email`, `user_name`, `password`, `role`, `verified`, `verified_by_admin`, `gedcomid` | change user fields |
+| `user.delete` | `user_id` | delete a user (refuses site administrators) |
+
+Roles (`role` / `canedit`): `none` < `access` (view) < `edit` < `accept` (moderator) < `admin` (tree manager).
+
+---
+
+## 5. Examples
+
+```bash
+SITE="https://your.tree.example"; TOKEN="your-token"
+api() { curl -s -G "$SITE/index.php" --data-urlencode "route=/abf-api" \
+        --data-urlencode "token=$TOKEN" "$@"; }
+
+# create a person
+api --data-urlencode "op=individual.create" \
+    --data-urlencode "given_name=Maria" --data-urlencode "surname=Muster" \
+    --data-urlencode "sex=F" --data-urlencode "birth_date=12 MAR 1980"
+
+# add her husband (creates him + the family + both-way links)
+api --data-urlencode "op=individual.addSpouse" --data-urlencode "xref=I123" \
+    --data-urlencode "given_name=Hans" --data-urlencode "surname=Muster" --data-urlencode "sex=M"
+
+# record their marriage
+api --data-urlencode "op=family.addEvent" --data-urlencode "family_xref=F45" \
+    --data-urlencode "date=10 JUN 2005" --data-urlencode "place=Wien"
+
+# approve a pending registrant and link them to their person
+api --data-urlencode "op=user.activate" --data-urlencode "user_id=42" \
+    --data-urlencode "xref=I123" --data-urlencode "role=edit"
+
+# list users who confirmed their email but aren't approved yet
+api --data-urlencode "op=user.list" --data-urlencode "filter=unverified"
+```
+
+---
+
+## 6. How it works / notes
+
 - All writes run as the configured `run_as_user_id` and are force-accepted via
-  `PendingChangesService`, so they go live immediately (no pending-change queue).
-- Name/place/date inputs are sanitised to prevent GEDCOM line-structure injection.
-- `individual.delete` only removes individuals with no family links (a safety guard).
+  `PendingChangesService`, so changes are live immediately (no pending-change queue).
+- New records get webtrees 2.x **X-series xrefs** (e.g. `X105`); older records keep their original
+  prefixes. Both are valid.
+- Inputs going into GEDCOM (names, places, dates, fact values) are sanitised to prevent line-break
+  / pointer injection. User fields (email etc.) keep their `@`.
+- GEDCOM dates should be in webtrees/GEDCOM form, e.g. `12 MAR 1980`, `ABT 1900`, `1990`.
+
+## 7. Limitations
+
+- **GET only** (webtrees CSRF blocks POST).
+- No record **merge** and no relationship **unlinking/removal** yet — use webtrees' built-in
+  *Merge records* tool for those (it safely re-points links).
+- `individual.delete` only removes individuals with **no** family links (guard against orphaning a
+  family); detach them in the UI first if needed.
+- Media, sources, repositories and notes-as-records are not yet exposed (notes can be added inline
+  via `individual.update` / `addFact`).
+
+## License
+
+Provided as-is. webtrees is GPL; treat this module accordingly.

@@ -150,6 +150,18 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
                 case 'individual.addChild':
                     return $this->individualAddChild($tree, $pcs, $params);
 
+                case 'individual.addParent':
+                    return $this->individualAddParent($tree, $pcs, $params);
+
+                case 'individual.addFact':
+                    return $this->individualAddFact($tree, $pcs, $params);
+
+                case 'family.get':
+                    return $this->familyGet($tree, $params);
+
+                case 'family.addEvent':
+                    return $this->familyAddEvent($tree, $pcs, $params);
+
                 case 'user.update':
                     return $this->userUpdate($user_service, $tree, $params);
 
@@ -499,6 +511,132 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
     }
 
     /**
+     * Add a parent (father/mother) to an existing individual — to their
+     * existing parents-family, a named family_xref, or a new one.
+     *
+     * @param array<string,mixed> $params
+     */
+    private function individualAddParent(Tree $tree, PendingChangesService $pcs, array $params): ResponseInterface
+    {
+        $child = Registry::individualFactory()->make($this->clean((string) ($params['xref'] ?? '')), $tree);
+        if ($child === null) {
+            return $this->json(['ok' => false, 'error' => 'xref (child) not found']);
+        }
+
+        $parent_xref = $this->clean((string) ($params['parent_xref'] ?? ''));
+        if ($parent_xref !== '') {
+            $parent = Registry::individualFactory()->make($parent_xref, $tree);
+            if ($parent === null) {
+                return $this->json(['ok' => false, 'error' => 'parent_xref not found']);
+            }
+        } else {
+            $parent = $this->makeIndividual($tree, $pcs, $params);
+            if ($parent === null) {
+                return $this->json(['ok' => false, 'error' => 'parent given_name and surname required']);
+            }
+        }
+
+        $link = $parent->sex() === 'F' ? 'WIFE' : 'HUSB';
+
+        $family      = null;
+        $family_xref = $this->clean((string) ($params['family_xref'] ?? ''));
+        if ($family_xref !== '') {
+            $family = Registry::familyFactory()->make($family_xref, $tree);
+            if ($family === null) {
+                return $this->json(['ok' => false, 'error' => 'family_xref not found']);
+            }
+        } elseif ($child->childFamilies()->count() === 1) {
+            $family = $child->childFamilies()->first();
+        }
+
+        if ($family !== null) {
+            $family->createFact('1 ' . $link . ' @' . $parent->xref() . '@', false);
+            $pcs->acceptRecord($this->reloadFamily($family, $tree));
+            $parent = $this->reload($parent);
+            $parent->createFact('1 FAMS @' . $family->xref() . '@', false);
+            $pcs->acceptRecord($this->reload($parent));
+        } else {
+            $family = $tree->createFamily('0 @@ FAM' . "\n1 CHIL @" . $child->xref() . "@\n1 " . $link . ' @' . $parent->xref() . '@');
+            $pcs->acceptRecord($family);
+            $child = $this->reload($child);
+            $child->createFact('1 FAMC @' . $family->xref() . '@', false);
+            $pcs->acceptRecord($this->reload($child));
+            $parent = $this->reload($parent);
+            $parent->createFact('1 FAMS @' . $family->xref() . '@', false);
+            $pcs->acceptRecord($this->reload($parent));
+        }
+
+        return $this->json([
+            'ok'     => true,
+            'parent' => $this->indiInfo($this->reload($parent)),
+            'family' => $family->xref(),
+            'child'  => $child->xref(),
+        ]);
+    }
+
+    /**
+     * Add an arbitrary fact to an individual (e.g. RESI, BAPM, EDUC, OCCU)
+     * with optional value, date and place.
+     *
+     * @param array<string,mixed> $params
+     */
+    private function individualAddFact(Tree $tree, PendingChangesService $pcs, array $params): ResponseInterface
+    {
+        $indi = Registry::individualFactory()->make($this->clean((string) ($params['xref'] ?? '')), $tree);
+        if ($indi === null) {
+            return $this->json(['ok' => false, 'error' => 'individual not found']);
+        }
+
+        $gedcom = $this->factGedcom($params);
+        if ($gedcom === null) {
+            return $this->json(['ok' => false, 'error' => 'valid tag required (2-10 letters), e.g. RESI/BAPM/EDUC']);
+        }
+
+        $indi = $this->applyFact($indi, $gedcom, $pcs);
+
+        return $this->json(['ok' => true, 'individual' => $this->indiInfo($indi)]);
+    }
+
+    /**
+     * @param array<string,mixed> $params
+     */
+    private function familyGet(Tree $tree, array $params): ResponseInterface
+    {
+        $family = Registry::familyFactory()->make($this->clean((string) ($params['xref'] ?? '')), $tree);
+        if ($family === null) {
+            return $this->json(['ok' => false, 'error' => 'family not found']);
+        }
+
+        return $this->json(['ok' => true, 'family' => $this->familyInfo($family)]);
+    }
+
+    /**
+     * Add an event to a family (default MARR) with optional date/place.
+     *
+     * @param array<string,mixed> $params
+     */
+    private function familyAddEvent(Tree $tree, PendingChangesService $pcs, array $params): ResponseInterface
+    {
+        $family = Registry::familyFactory()->make($this->clean((string) ($params['family_xref'] ?? $params['xref'] ?? '')), $tree);
+        if ($family === null) {
+            return $this->json(['ok' => false, 'error' => 'family not found']);
+        }
+
+        if (!isset($params['tag'])) {
+            $params['tag'] = 'MARR';
+        }
+        $gedcom = $this->factGedcom($params);
+        if ($gedcom === null) {
+            return $this->json(['ok' => false, 'error' => 'valid tag required (2-10 letters), e.g. MARR/DIV']);
+        }
+
+        $family->createFact($gedcom, false);
+        $pcs->acceptRecord($this->reloadFamily($family, $tree));
+
+        return $this->json(['ok' => true, 'family' => $this->familyInfo($this->reloadFamily($family, $tree))]);
+    }
+
+    /**
      * @param array<string,mixed> $params
      */
     private function userUpdate(UserService $user_service, Tree $tree, array $params): ResponseInterface
@@ -634,6 +772,60 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
         $pcs->acceptRecord($indi);
 
         return $this->reload($indi);
+    }
+
+    private function reloadFamily(Family $family, Tree $tree): Family
+    {
+        return Registry::familyFactory()->make($family->xref(), $tree) ?? $family;
+    }
+
+    /**
+     * @return array<string,mixed>
+     */
+    private function familyInfo(Family $family): array
+    {
+        $husband = $family->husband();
+        $wife    = $family->wife();
+
+        return [
+            'xref'     => $family->xref(),
+            'husband'  => $husband === null ? null : ['xref' => $husband->xref(), 'name' => strip_tags($husband->fullName())],
+            'wife'     => $wife === null ? null : ['xref' => $wife->xref(), 'name' => strip_tags($wife->fullName())],
+            'children' => $family->children()
+                ->map(static fn (Individual $c): array => ['xref' => $c->xref(), 'name' => strip_tags($c->fullName())])
+                ->values()
+                ->all(),
+        ];
+    }
+
+    /**
+     * Build a "1 TAG [value] / 2 DATE / 2 PLAC" fact from tag/value/date/place params.
+     * Returns null if the tag is missing/invalid.
+     *
+     * @param array<string,mixed> $params
+     */
+    private function factGedcom(array $params): ?string
+    {
+        $tag = strtoupper($this->clean((string) ($params['tag'] ?? '')));
+        if (preg_match('/^[A-Z_]{2,10}$/', $tag) !== 1) {
+            return null;
+        }
+        $value = $this->clean((string) ($params['value'] ?? ''));
+        $date  = $this->clean((string) ($params['date'] ?? ''));
+        $place = $this->clean((string) ($params['place'] ?? ''));
+
+        $gedcom = '1 ' . $tag;
+        if ($value !== '') {
+            $gedcom .= ' ' . $value;
+        }
+        if ($date !== '') {
+            $gedcom .= "\n2 DATE " . $date;
+        }
+        if ($place !== '') {
+            $gedcom .= "\n2 PLAC " . $place;
+        }
+
+        return $gedcom;
     }
 
     /**
