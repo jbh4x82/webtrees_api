@@ -1024,7 +1024,10 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
         if ($row === null) {
             return null;
         }
-        $title = DB::table('gedcom_setting')
+        // webtrees 2.2.6 (schema 46) moved 'title' from gedcom_setting into a
+        // gedcom.title column. Prefer the column; fall back to the old setting,
+        // then to the gedcom name. Works on both schemas.
+        $title = $row->title ?? DB::table('gedcom_setting')
             ->where('gedcom_id', '=', $row->gedcom_id)
             ->where('setting_name', '=', 'title')
             ->value('setting_value');
