@@ -133,6 +133,7 @@ Every call needs `op=<operation>` plus the params below. `?` marks optional para
 | `ping` | — | health check (tree + acting user) |
 | `individual.get` | `xref` | xref, name, sex, spouse-families |
 | `family.get` | `xref` | husband, wife, children |
+| `record.facts` | `xref` | every fact of an individual/family with its **fact id** (needed to edit/delete a specific fact) |
 | `user.lookup` | `user_id` \| `email` \| `user_name` | user + tree role/link |
 | `user.list` | `filter`=`all`\|`unverified`\|`unlinked`, `limit?` | list of users |
 
@@ -155,6 +156,18 @@ Every call needs `op=<operation>` plus the params below. `?` marks optional para
 | op | params | does |
 |---|---|---|
 | `family.addEvent` | `family_xref`, `tag?`(=`MARR`), `date?`, `place?`, `value?` | add a marriage/other family event |
+| `family.addChild` | `family_xref`, `child_xref` | link an **existing** individual into a family as a child |
+| `family.delete` | `xref` | delete a family (webtrees auto-unlinks the spouses & children) |
+
+### Edit any record (individual *or* family)
+| op | params | does |
+|---|---|---|
+| `record.facts` | `xref` | list facts with their ids (call this first to get a `fact_id`) |
+| `record.updateFact` | `xref`, `fact_id`, `gedcom` (a single level-1 fact, may include level-2+ sub-lines) | replace a fact |
+| `record.deleteFact` | `xref`, `fact_id` | delete a fact (also works on link-facts) |
+| `record.unlink` | `xref`, `other_xref` | remove **all** links between two records, both directions (detach a child, undo a spouse link, etc.) |
+
+> **Note:** a fact's `fact_id` is a hash of its content, so it **changes after `updateFact`**. Re-run `record.facts` to get the new id before deleting/editing again.
 
 ### Users (admin)
 | op | params | does |
@@ -211,10 +224,10 @@ api --data-urlencode "op=user.list" --data-urlencode "filter=unverified"
 ## 7. Limitations
 
 - **GET only** (webtrees CSRF blocks POST).
-- No record **merge** and no relationship **unlinking/removal** yet — use webtrees' built-in
-  *Merge records* tool for those (it safely re-points links).
+- No record **merge** yet — use webtrees' built-in *Merge records* tool (it safely re-points all
+  links). Everything else (edit/delete facts, unlink relationships, delete families) is supported.
 - `individual.delete` only removes individuals with **no** family links (guard against orphaning a
-  family); detach them in the UI first if needed.
+  family); use `record.unlink` or `family.delete` to detach first.
 - Media, sources, repositories and notes-as-records are not yet exposed (notes can be added inline
   via `individual.update` / `addFact`).
 

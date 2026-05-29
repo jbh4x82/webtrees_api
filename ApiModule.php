@@ -9,7 +9,9 @@ use Fig\Http\Message\StatusCodeInterface;
 use Fisharebest\Webtrees\Auth;
 use Fisharebest\Webtrees\Contracts\UserInterface;
 use Fisharebest\Webtrees\DB;
+use Fisharebest\Webtrees\Fact;
 use Fisharebest\Webtrees\Family;
+use Fisharebest\Webtrees\GedcomRecord;
 use Fisharebest\Webtrees\I18N;
 use Fisharebest\Webtrees\Individual;
 use Fisharebest\Webtrees\Registry;
@@ -161,6 +163,24 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
 
                 case 'family.addEvent':
                     return $this->familyAddEvent($tree, $pcs, $params);
+
+                case 'family.addChild':
+                    return $this->familyAddChild($tree, $pcs, $params);
+
+                case 'family.delete':
+                    return $this->familyDelete($tree, $pcs, $params);
+
+                case 'record.facts':
+                    return $this->recordFacts($tree, $params);
+
+                case 'record.updateFact':
+                    return $this->recordUpdateFact($tree, $pcs, $params);
+
+                case 'record.deleteFact':
+                    return $this->recordDeleteFact($tree, $pcs, $params);
+
+                case 'record.unlink':
+                    return $this->recordUnlink($tree, $pcs, $params);
 
                 case 'user.update':
                     return $this->userUpdate($user_service, $tree, $params);
@@ -637,6 +657,145 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
     }
 
     /**
+     * Link an EXISTING individual as a child of a family.
+     *
+     * @param array<string,mixed> $params
+     */
+    private function familyAddChild(Tree $tree, PendingChangesService $pcs, array $params): ResponseInterface
+    {
+        $family = Registry::familyFactory()->make($this->clean((string) ($params['family_xref'] ?? '')), $tree);
+        if ($family === null) {
+            return $this->json(['ok' => false, 'error' => 'family_xref not found']);
+        }
+        $child = Registry::individualFactory()->make($this->clean((string) ($params['child_xref'] ?? '')), $tree);
+        if ($child === null) {
+            return $this->json(['ok' => false, 'error' => 'child_xref not found']);
+        }
+
+        $family->createFact('1 CHIL @' . $child->xref() . '@', false);
+        $pcs->acceptRecord($this->reloadFamily($family, $tree));
+        $child = $this->reload($child);
+        $child->createFact('1 FAMC @' . $family->xref() . '@', false);
+        $pcs->acceptRecord($this->reload($child));
+
+        return $this->json(['ok' => true, 'family' => $this->familyInfo($this->reloadFamily($family, $tree))]);
+    }
+
+    /**
+     * Delete a family record. webtrees unlinks the spouses/children automatically.
+     *
+     * @param array<string,mixed> $params
+     */
+    private function familyDelete(Tree $tree, PendingChangesService $pcs, array $params): ResponseInterface
+    {
+        $family = Registry::familyFactory()->make($this->clean((string) ($params['xref'] ?? '')), $tree);
+        if ($family === null) {
+            return $this->json(['ok' => false, 'error' => 'family not found']);
+        }
+
+        $xref = $family->xref();
+        $family->deleteRecord();
+        $pcs->acceptRecord($family);
+
+        return $this->json(['ok' => true, 'deleted' => $xref]);
+    }
+
+    /**
+     * List a record's facts with their ids (needed to update/delete a specific fact).
+     *
+     * @param array<string,mixed> $params
+     */
+    private function recordFacts(Tree $tree, array $params): ResponseInterface
+    {
+        $record = $this->resolveRecord($tree, (string) ($params['xref'] ?? ''));
+        if ($record === null) {
+            return $this->json(['ok' => false, 'error' => 'record not found']);
+        }
+
+        $facts = $record->facts([], false, null, true)
+            ->map(static fn (Fact $f): array => ['id' => $f->id(), 'tag' => $f->tag(), 'gedcom' => $f->gedcom()])
+            ->values()
+            ->all();
+
+        return $this->json(['ok' => true, 'xref' => $record->xref(), 'facts' => $facts]);
+    }
+
+    /**
+     * Replace one fact (by id) with new GEDCOM. The gedcom must be a single
+     * level-1 fact (it may contain level 2+ sub-lines).
+     *
+     * @param array<string,mixed> $params
+     */
+    private function recordUpdateFact(Tree $tree, PendingChangesService $pcs, array $params): ResponseInterface
+    {
+        $record = $this->resolveRecord($tree, (string) ($params['xref'] ?? ''));
+        if ($record === null) {
+            return $this->json(['ok' => false, 'error' => 'record not found']);
+        }
+        $fact_id = $this->clean((string) ($params['fact_id'] ?? ''));
+        if ($fact_id === '') {
+            return $this->json(['ok' => false, 'error' => 'fact_id required']);
+        }
+
+        $gedcom = str_replace(["\r", "\t"], '', (string) ($params['gedcom'] ?? ''));
+        if (!str_starts_with($gedcom, '1 ') || str_contains($gedcom, "\n0 ")) {
+            return $this->json(['ok' => false, 'error' => 'gedcom must be a single level-1 fact (start "1 ", no level-0 lines)']);
+        }
+
+        $record->updateFact($fact_id, $gedcom, true);
+        $pcs->acceptRecord($record);
+
+        return $this->json(['ok' => true, 'xref' => $record->xref(), 'fact_id' => $fact_id]);
+    }
+
+    /**
+     * Delete one fact (by id). Works for events and for link-facts (CHIL/FAMS/etc.).
+     *
+     * @param array<string,mixed> $params
+     */
+    private function recordDeleteFact(Tree $tree, PendingChangesService $pcs, array $params): ResponseInterface
+    {
+        $record = $this->resolveRecord($tree, (string) ($params['xref'] ?? ''));
+        if ($record === null) {
+            return $this->json(['ok' => false, 'error' => 'record not found']);
+        }
+        $fact_id = $this->clean((string) ($params['fact_id'] ?? ''));
+        if ($fact_id === '') {
+            return $this->json(['ok' => false, 'error' => 'fact_id required']);
+        }
+
+        $record->deleteFact($fact_id, true);
+        $pcs->acceptRecord($record);
+
+        return $this->json(['ok' => true, 'xref' => $record->xref(), 'deleted_fact' => $fact_id]);
+    }
+
+    /**
+     * Remove ALL links between two records (both directions) — e.g. detach a
+     * child from a family, or undo a spouse link.
+     *
+     * @param array<string,mixed> $params
+     */
+    private function recordUnlink(Tree $tree, PendingChangesService $pcs, array $params): ResponseInterface
+    {
+        $a = $this->resolveRecord($tree, (string) ($params['xref'] ?? ''));
+        $b = $this->resolveRecord($tree, (string) ($params['other_xref'] ?? ''));
+        if ($a === null || $b === null) {
+            return $this->json(['ok' => false, 'error' => 'xref and other_xref must both exist']);
+        }
+
+        $a_xref = $a->xref();
+        $b_xref = $b->xref();
+        $a->removeLinks($b_xref, true);
+        $pcs->acceptRecord($this->resolveRecord($tree, $a_xref) ?? $a);
+        $b = $this->resolveRecord($tree, $b_xref) ?? $b;
+        $b->removeLinks($a_xref, true);
+        $pcs->acceptRecord($this->resolveRecord($tree, $b_xref) ?? $b);
+
+        return $this->json(['ok' => true, 'unlinked' => [$a_xref, $b_xref]]);
+    }
+
+    /**
      * @param array<string,mixed> $params
      */
     private function userUpdate(UserService $user_service, Tree $tree, array $params): ResponseInterface
@@ -777,6 +936,14 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
     private function reloadFamily(Family $family, Tree $tree): Family
     {
         return Registry::familyFactory()->make($family->xref(), $tree) ?? $family;
+    }
+
+    /**
+     * Resolve any record (individual, family, source, …) by xref.
+     */
+    private function resolveRecord(Tree $tree, string $xref): ?GedcomRecord
+    {
+        return Registry::gedcomRecordFactory()->make($this->clean($xref), $tree);
     }
 
     /**
