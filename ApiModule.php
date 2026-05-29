@@ -947,6 +947,20 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
     }
 
     /**
+     * Resolve a tree by name. Called AFTER elevation (run-as admin), so
+     * TreeService::all() returns the private tree too. Using the service avoids
+     * depending on the Tree constructor signature (which changed in 2.2.6).
+     */
+    private function resolveTree(string $name): ?Tree
+    {
+        $name = $this->clean($name);
+
+        return Registry::container()->get(\Fisharebest\Webtrees\Services\TreeService::class)
+            ->all()
+            ->first(static fn (Tree $t): bool => $t->name() === $name);
+    }
+
+    /**
      * @return array<string,mixed>
      */
     private function familyInfo(Family $family): array
@@ -1016,23 +1030,6 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
         }
 
         return $gedcom;
-    }
-
-    private function resolveTree(string $name): ?Tree
-    {
-        $row = DB::table('gedcom')->where('gedcom_name', '=', $name)->where('gedcom_id', '>', 0)->first();
-        if ($row === null) {
-            return null;
-        }
-        // webtrees 2.2.6 (schema 46) moved 'title' from gedcom_setting into a
-        // gedcom.title column. Prefer the column; fall back to the old setting,
-        // then to the gedcom name. Works on both schemas.
-        $title = $row->title ?? DB::table('gedcom_setting')
-            ->where('gedcom_id', '=', $row->gedcom_id)
-            ->where('setting_name', '=', 'title')
-            ->value('setting_value');
-
-        return new Tree((int) $row->gedcom_id, $row->gedcom_name, (string) ($title ?? $row->gedcom_name));
     }
 
     /**
