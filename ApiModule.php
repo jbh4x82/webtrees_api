@@ -786,13 +786,30 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
 
         $a_xref = $a->xref();
         $b_xref = $b->xref();
-        $a->removeLinks($b_xref, true);
-        $pcs->acceptRecord($this->resolveRecord($tree, $a_xref) ?? $a);
-        $b = $this->resolveRecord($tree, $b_xref) ?? $b;
-        $b->removeLinks($a_xref, true);
-        $pcs->acceptRecord($this->resolveRecord($tree, $b_xref) ?? $b);
+
+        $this->stripLink($a, $b_xref, $pcs);
+        $b = $this->resolveRecord($tree, $b_xref);
+        if ($b !== null) {
+            $this->stripLink($b, $a_xref, $pcs);
+        }
 
         return $this->json(['ok' => true, 'unlinked' => [$a_xref, $b_xref]]);
+    }
+
+    /**
+     * Remove all level-1 links to $xref from a record's GEDCOM, then save.
+     * (webtrees 2.2.6 removed GedcomRecord::removeLinks(); this mirrors the
+     * regex DeleteRecord uses.)
+     */
+    private function stripLink(GedcomRecord $record, string $xref, PendingChangesService $pcs): void
+    {
+        $old = $record->gedcom();
+        $new = preg_replace('/\n1 [A-Z_]+ @' . preg_quote($xref, '/') . '@(\n[2-9].*)*/', '', $old);
+
+        if ($new !== null && $new !== $old) {
+            $record->updateRecord($new, false);
+            $pcs->acceptRecord($record);
+        }
     }
 
     /**
