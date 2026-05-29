@@ -144,6 +144,18 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
                 case 'individual.delete':
                     return $this->individualDelete($tree, $pcs, $params);
 
+                case 'individual.update':
+                    return $this->individualUpdate($tree, $pcs, $params);
+
+                case 'individual.addChild':
+                    return $this->individualAddChild($tree, $pcs, $params);
+
+                case 'user.update':
+                    return $this->userUpdate($user_service, $tree, $params);
+
+                case 'user.list':
+                    return $this->userList($user_service, $tree, $params);
+
                 default:
                     return $this->json(['ok' => false, 'error' => 'unknown op: ' . $op], StatusCodeInterface::STATUS_BAD_REQUEST);
             }
@@ -352,6 +364,221 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
         return $this->json(['ok' => true, 'deleted' => $xref]);
     }
 
+    /**
+     * Add/replace facts on an existing individual: rename, sex, birth, death, occupation, note.
+     *
+     * @param array<string,mixed> $params
+     */
+    private function individualUpdate(Tree $tree, PendingChangesService $pcs, array $params): ResponseInterface
+    {
+        $xref = $this->clean((string) ($params['xref'] ?? ''));
+        $indi = Registry::individualFactory()->make($xref, $tree);
+        if ($indi === null) {
+            return $this->json(['ok' => false, 'error' => 'individual not found']);
+        }
+
+        $changed = [];
+
+        $new_given   = $this->clean((string) ($params['new_given'] ?? ''));
+        $new_surname = $this->clean((string) ($params['new_surname'] ?? ''));
+        if ($new_given !== '' || $new_surname !== '') {
+            $name_fact = $indi->facts(['NAME'])->first();
+            $gedcom    = '1 NAME ' . $new_given . ' /' . $new_surname . '/';
+            if ($name_fact !== null) {
+                $indi->updateFact($name_fact->id(), $gedcom, false);
+            } else {
+                $indi->createFact($gedcom, false);
+            }
+            $pcs->acceptRecord($indi);
+            $indi      = $this->reload($indi);
+            $changed[] = 'name';
+        }
+
+        $sex = strtoupper($this->clean((string) ($params['sex'] ?? '')));
+        if (in_array($sex, ['M', 'F', 'U'], true)) {
+            $sex_fact = $indi->facts(['SEX'])->first();
+            if ($sex_fact !== null) {
+                $indi->updateFact($sex_fact->id(), '1 SEX ' . $sex, false);
+            } else {
+                $indi->createFact('1 SEX ' . $sex, false);
+            }
+            $pcs->acceptRecord($indi);
+            $indi      = $this->reload($indi);
+            $changed[] = 'sex';
+        }
+
+        $birth = $this->eventGedcom('BIRT', $params, 'birth_date', 'birth_place');
+        if ($birth !== '') {
+            $indi      = $this->applyFact($indi, $birth, $pcs);
+            $changed[] = 'birth';
+        }
+        $death = $this->eventGedcom('DEAT', $params, 'death_date', 'death_place');
+        if ($death !== '') {
+            $indi      = $this->applyFact($indi, $death, $pcs);
+            $changed[] = 'death';
+        }
+        $occ = $this->clean((string) ($params['occupation'] ?? ''));
+        if ($occ !== '') {
+            $indi      = $this->applyFact($indi, '1 OCCU ' . $occ, $pcs);
+            $changed[] = 'occupation';
+        }
+        $note = $this->clean((string) ($params['note'] ?? ''));
+        if ($note !== '') {
+            $indi      = $this->applyFact($indi, '1 NOTE ' . $note, $pcs);
+            $changed[] = 'note';
+        }
+
+        if ($changed === []) {
+            return $this->json(['ok' => false, 'error' => 'no update fields provided']);
+        }
+
+        return $this->json(['ok' => true, 'updated' => $changed, 'individual' => $this->indiInfo($this->reload($indi))]);
+    }
+
+    /**
+     * Add a child to an existing parent (to their single couple-family, a named
+     * family_xref, or a new single-parent family).
+     *
+     * @param array<string,mixed> $params
+     */
+    private function individualAddChild(Tree $tree, PendingChangesService $pcs, array $params): ResponseInterface
+    {
+        $parent = Registry::individualFactory()->make($this->clean((string) ($params['parent_xref'] ?? '')), $tree);
+        if ($parent === null) {
+            return $this->json(['ok' => false, 'error' => 'parent_xref not found']);
+        }
+
+        $given   = $this->clean((string) ($params['given_name'] ?? ''));
+        $surname = $this->clean((string) ($params['surname'] ?? ''));
+        $sex     = strtoupper($this->clean((string) ($params['sex'] ?? 'U')));
+        if ($given === '' || $surname === '') {
+            return $this->json(['ok' => false, 'error' => 'given_name and surname required']);
+        }
+        if (!in_array($sex, ['M', 'F', 'U'], true)) {
+            $sex = 'U';
+        }
+        $name_sex = "\n1 NAME " . $given . ' /' . $surname . "/\n1 SEX " . $sex;
+
+        $family      = null;
+        $family_xref = $this->clean((string) ($params['family_xref'] ?? ''));
+        if ($family_xref !== '') {
+            $family = Registry::familyFactory()->make($family_xref, $tree);
+            if ($family === null) {
+                return $this->json(['ok' => false, 'error' => 'family_xref not found']);
+            }
+        } elseif ($parent->spouseFamilies()->count() === 1) {
+            $family = $parent->spouseFamilies()->first();
+        }
+
+        if ($family !== null) {
+            $child = $tree->createIndividual('0 @@ INDI' . "\n1 FAMC @" . $family->xref() . '@' . $name_sex);
+            $pcs->acceptRecord($child);
+            $family = Registry::familyFactory()->make($family->xref(), $tree);
+            $family->createFact('1 CHIL @' . $child->xref() . '@', false);
+            $pcs->acceptRecord(Registry::familyFactory()->make($family->xref(), $tree));
+        } else {
+            $child = $tree->createIndividual('0 @@ INDI' . $name_sex);
+            $pcs->acceptRecord($child);
+            $link   = $parent->sex() === 'F' ? 'WIFE' : 'HUSB';
+            $family = $tree->createFamily('0 @@ FAM' . "\n1 " . $link . ' @' . $parent->xref() . "@\n1 CHIL @" . $child->xref() . '@');
+            $pcs->acceptRecord($family);
+            $parent = $this->reload($parent);
+            $parent->createFact('1 FAMS @' . $family->xref() . '@', false);
+            $pcs->acceptRecord($this->reload($parent));
+            $child = $this->reload($child);
+            $child->createFact('1 FAMC @' . $family->xref() . '@', false);
+            $pcs->acceptRecord($this->reload($child));
+        }
+
+        return $this->json([
+            'ok'     => true,
+            'child'  => $this->indiInfo($this->reload($child)),
+            'family' => $family->xref(),
+            'parent' => $parent->xref(),
+        ]);
+    }
+
+    /**
+     * @param array<string,mixed> $params
+     */
+    private function userUpdate(UserService $user_service, Tree $tree, array $params): ResponseInterface
+    {
+        $user = $user_service->find((int) ($params['user_id'] ?? 0));
+        if ($user === null) {
+            return $this->json(['ok' => false, 'error' => 'user not found']);
+        }
+
+        $changed = [];
+        if (isset($params['real_name'])) { $user->setRealName($this->clean((string) $params['real_name'])); $changed[] = 'real_name'; }
+        if (isset($params['email']))     { $user->setEmail($this->clean((string) $params['email'])); $changed[] = 'email'; }
+        if (isset($params['user_name'])) { $user->setUserName($this->clean((string) $params['user_name'])); $changed[] = 'user_name'; }
+        if (isset($params['password']))  { $user->setPassword((string) $params['password']); $changed[] = 'password'; }
+        if (isset($params['verified']))          { $user->setPreference('verified', ((string) $params['verified']) === '1' ? '1' : '0'); $changed[] = 'verified'; }
+        if (isset($params['verified_by_admin'])) { $user->setPreference('verified_by_admin', ((string) $params['verified_by_admin']) === '1' ? '1' : '0'); $changed[] = 'verified_by_admin'; }
+        if (isset($params['role'])) {
+            $role = (string) $params['role'];
+            if (in_array($role, ['none', 'access', 'edit', 'accept', 'admin'], true)) {
+                $tree->setUserPreference($user, 'canedit', $role);
+                $changed[] = 'role';
+            }
+        }
+        if (isset($params['gedcomid'])) {
+            $gid = $this->clean((string) $params['gedcomid']);
+            $tree->setUserPreference($user, UserInterface::PREF_TREE_ACCOUNT_XREF, $gid);
+            $tree->setUserPreference($user, 'rootid', $gid);
+            $changed[] = 'gedcomid';
+        }
+
+        if ($changed === []) {
+            return $this->json(['ok' => false, 'error' => 'no update fields provided']);
+        }
+
+        return $this->json(['ok' => true, 'updated' => $changed, 'user' => $this->userInfo($user_service->find($user->id()), $tree)]);
+    }
+
+    /**
+     * List users. filter = all | unverified | unlinked.
+     *
+     * @param array<string,mixed> $params
+     */
+    private function userList(UserService $user_service, Tree $tree, array $params): ResponseInterface
+    {
+        $filter = (string) ($params['filter'] ?? 'all');
+        $limit  = max(1, min(1000, (int) ($params['limit'] ?? 200)));
+
+        $out = [];
+        foreach ($user_service->all() as $u) {
+            if ($u->id() <= 0) {
+                continue;
+            }
+            $verified = $u->getPreference('verified');
+            $admin_ok = $u->getPreference('verified_by_admin');
+            $gid      = $tree->getUserPreference($u, UserInterface::PREF_TREE_ACCOUNT_XREF);
+
+            if ($filter === 'unverified' && $verified === '1' && $admin_ok === '1') {
+                continue;
+            }
+            if ($filter === 'unlinked' && $gid !== '') {
+                continue;
+            }
+
+            $out[] = [
+                'user_id'           => $u->id(),
+                'user_name'         => $u->userName(),
+                'real_name'         => $u->realName(),
+                'email'             => $u->email(),
+                'verified'          => $verified,
+                'verified_by_admin' => $admin_ok,
+                'gedcomid'          => $gid,
+            ];
+            if (count($out) >= $limit) {
+                break;
+            }
+        }
+
+        return $this->json(['ok' => true, 'filter' => $filter, 'count' => count($out), 'users' => $out]);
+    }
+
     // ───────────────────────────── helpers ─────────────────────────────
 
     /**
@@ -395,6 +622,41 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
     private function reload(Individual $indi): Individual
     {
         return Registry::individualFactory()->make($indi->xref(), $indi->tree()) ?? $indi;
+    }
+
+    /**
+     * Add one fact and accept it immediately (so multiple facts don't clobber
+     * each other — each pending change is based on the latest accepted gedcom).
+     */
+    private function applyFact(Individual $indi, string $gedcom, PendingChangesService $pcs): Individual
+    {
+        $indi->createFact($gedcom, false);
+        $pcs->acceptRecord($indi);
+
+        return $this->reload($indi);
+    }
+
+    /**
+     * Build a "1 TAG / 2 DATE / 2 PLAC" event block from scalar params, or '' if none.
+     *
+     * @param array<string,mixed> $params
+     */
+    private function eventGedcom(string $tag, array $params, string $date_key, string $place_key): string
+    {
+        $date  = $this->clean((string) ($params[$date_key] ?? ''));
+        $place = $this->clean((string) ($params[$place_key] ?? ''));
+        if ($date === '' && $place === '') {
+            return '';
+        }
+        $gedcom = '1 ' . $tag;
+        if ($date !== '') {
+            $gedcom .= "\n2 DATE " . $date;
+        }
+        if ($place !== '') {
+            $gedcom .= "\n2 PLAC " . $place;
+        }
+
+        return $gedcom;
     }
 
     private function resolveTree(string $name): ?Tree

@@ -31,7 +31,11 @@ Optional `tree` param (defaults to the configured tree).
 | `individual.get` | `xref` | return an individual |
 | `individual.create` | `given_name`, `surname`, `sex`=M/F/U, `birth_date?`, `birth_place?` | create an individual |
 | `individual.addSpouse` | `xref` (existing) + (`spouse_xref` \| `given_name`,`surname`,`sex`) | create/link a spouse, build the family, link both ways |
+| `individual.addChild` | `parent_xref` + `given_name`,`surname`,`sex` (+ `family_xref?`) | add a child (to the parent's couple-family, a named family, or a new one) |
+| `individual.update` | `xref` + any of `new_given`,`new_surname`,`sex`,`birth_date`,`birth_place`,`death_date`,`death_place`,`occupation`,`note` | rename + add/replace facts |
 | `individual.delete` | `xref` | delete a family-less individual (test cleanup) |
+| `user.update` | `user_id` + any of `real_name`,`email`,`user_name`,`password`,`role`,`verified`,`verified_by_admin`,`gedcomid` | change user fields |
+| `user.list` | `filter`=all\|unverified\|unlinked, `limit?` | list users |
 
 ### Example
 ```bash
