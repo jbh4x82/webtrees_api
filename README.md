@@ -179,6 +179,27 @@ Every call needs `op=<operation>` plus the params below. `?` marks optional para
 
 Roles (`role` / `canedit`): `none` < `access` (view) < `edit` < `accept` (moderator) < `admin` (tree manager).
 
+### Forum (requires the companion `forum` module)
+| op | params | does |
+|---|---|---|
+| `forum.listCategories` | — | list existing categories with topic counts |
+| `forum.postTopic` | `title`, `body`, `category`, `author` (XREF), `broadcast?`=1, `attachment[]?`, `attachment_paths?`, `strict?` | create a topic on **author's** behalf — bypasses the keyword filter and the once-per-2h author rate limit, since the call is admin-token-gated. With `broadcast=1` (default) emails go out to every subscribed family member, exactly as if the author had posted through the UI |
+| `forum.addComment` | `topic_id`, `text`, `author` (XREF), `notify?`=1, `attachment[]?`, `attachment_paths?`, `strict?` | append a comment on author's behalf and (with `notify=1`) email prior participants |
+| `forum.deleteTopic` | `topic_id` | hard-delete a topic, all its comments, and all outbox rows for it |
+| `forum.deleteComment` | `message_id` | delete a single comment; the topic too if it was the last one |
+
+**Attachments** — accepted via either of:
+- **Multipart upload** — POST the file(s) as `attachment` or `attachment[]` form fields (the same field names the in-UI form uses). One file or many. Per-file cap **10 MB**; extension allowlist mirrors the forum module.
+- **Pre-staged paths** — `attachment_paths` is a JSON array (or a comma-separated string) of **absolute server-side paths** to files you already placed on the server (via SFTP/FTP/SSH). The API will MOVE each file (or copy on cross-filesystem) into the canonical `data/forum_attachments/<sub>/<name>` location and generate the public URL.
+
+By default an attachment that fails validation (wrong extension, too big, missing) is **silently skipped** and the post still goes through — pass `strict=1` to make the whole call fail instead.
+
+**`author` is the XREF**, e.g. `I1092`. It must match a row in `v_meran_user` (a webtrees-linked family member). For a posting on behalf of a non-linked user, link them first via `user.activate`.
+
+**Broadcast behaviour** — `broadcast=1` (default) calls `ForumMailer::broadcastTopic`, which enqueues every eligible family member into `meran_forum_outbox` then drains under a soft 50 s budget; whatever doesn't finish is mopped up by the existing 5-min `forum-outbox-cron`. The response includes a count: `{ enqueued, sent, failed, remaining }`. Set `broadcast=0` to skip sending entirely (topic still goes live on the forum).
+
+**`notify` on comments** — `notify=1` (default) calls `ForumMailer::notifyReply`, which emails only prior participants in that topic.
+
 ---
 
 ## 5. Examples
@@ -207,6 +228,30 @@ api --data-urlencode "op=user.activate" --data-urlencode "user_id=42" \
 
 # list users who confirmed their email but aren't approved yet
 api --data-urlencode "op=user.list" --data-urlencode "filter=unverified"
+
+# post a forum topic on behalf of user I1092, then broadcast to family
+api --data-urlencode "op=forum.postTopic" \
+    --data-urlencode "title=Family reunion 2027 — save the date" \
+    --data-urlencode "body=Hi everyone, blocking the weekend of ..." \
+    --data-urlencode "category=General" --data-urlencode "author=I1092"
+
+# same, but with a pre-staged PDF attachment and no broadcast
+api --data-urlencode "op=forum.postTopic" \
+    --data-urlencode "title=Photo album scan" --data-urlencode "body=See attached." \
+    --data-urlencode "category=Family" --data-urlencode "author=I1092" \
+    --data-urlencode "broadcast=0" \
+    --data-urlencode 'attachment_paths=["/tmp/album.pdf"]'
+
+# upload a file inline via multipart (note: POST not GET)
+curl -s "$SITE/index.php?route=/abf-api" \
+    -F "token=$TOKEN" -F "op=forum.postTopic" \
+    -F "title=Inline upload demo" -F "body=One file via multipart." \
+    -F "category=General" -F "author=I1092" \
+    -F "attachment[]=@/path/to/file.pdf"
+
+# reply to a topic and notify participants
+api --data-urlencode "op=forum.addComment" --data-urlencode "topic_id=3592" \
+    --data-urlencode "text=Thanks for sharing!" --data-urlencode "author=I45"
 ```
 
 ---

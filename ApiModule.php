@@ -188,6 +188,21 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
                 case 'user.list':
                     return $this->userList($user_service, $tree, $params);
 
+                case 'forum.listCategories':
+                    return $this->forumListCategories();
+
+                case 'forum.postTopic':
+                    return $this->forumPostTopic($tree, $request, $params);
+
+                case 'forum.addComment':
+                    return $this->forumAddComment($tree, $request, $params);
+
+                case 'forum.deleteTopic':
+                    return $this->forumDeleteTopic($params);
+
+                case 'forum.deleteComment':
+                    return $this->forumDeleteComment($params);
+
                 default:
                     return $this->json(['ok' => false, 'error' => 'unknown op: ' . $op], StatusCodeInterface::STATUS_BAD_REQUEST);
             }
@@ -1131,5 +1146,490 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
         }
 
         return array_merge($query, $body);
+    }
+
+    // ───────────────────────────── forum ops ─────────────────────────────
+
+    /**
+     * Allowed attachment extensions. Mirrors ForumModule::ALLOWED_ATTACHMENT_EXTS;
+     * duplicated here so the api module has no hard dependency on the forum
+     * module being installed at any particular version. Keep in sync.
+     */
+    private const FORUM_ALLOWED_EXTS = [
+        'pdf', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'heic',
+        'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
+        'txt', 'csv', 'rtf', 'odt', 'ods', 'odp',
+        'zip', 'mp3', 'mp4', 'm4a', 'mov', 'wav',
+    ];
+
+    /** 10 MB cap per attachment (mirrors ForumModule). */
+    private const FORUM_MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+
+    /** Title length cap (mirrors meran_forum_topics.title VARCHAR(150)). */
+    private const FORUM_TITLE_MAX = 150;
+
+    /**
+     * The forum module's classes are not on the composer autoloader (they live
+     * in modules_v4/forum/, namespace Fisharebest\Webtrees\). require_once them
+     * lazily so the api module still loads cleanly if the forum module is absent.
+     */
+    private function requireForum(): void
+    {
+        $base = __DIR__ . '/../forum/';
+        if (!is_dir($base)) {
+            throw new \RuntimeException('forum module not installed at modules_v4/forum/');
+        }
+        foreach (['ForumTopicCreator.php', 'ForumOutbox.php', 'ForumMailer.php', 'ForumModule.php'] as $f) {
+            $p = $base . $f;
+            if (!is_file($p)) {
+                throw new \RuntimeException('forum module file missing: ' . $f);
+            }
+            require_once $p;
+        }
+    }
+
+    /**
+     * Distinct categories present in the forum. Useful for the caller to
+     * validate `category` before posting (the forum schema doesn't constrain
+     * it, but writing a typo'd category produces an orphan bucket).
+     */
+    private function forumListCategories(): ResponseInterface
+    {
+        $this->requireForum();
+        // Raw SQL: forum tables are NOT under the webtrees wt_ prefix,
+        // so DB::table() would mis-prefix them. DB::select() runs verbatim.
+        $rows = DB::select('SELECT forum, COUNT(*) AS topics FROM meran_forum_topics GROUP BY forum ORDER BY topics DESC');
+        $cats = [];
+        foreach ($rows as $r) {
+            $cats[] = ['name' => (string) $r->forum, 'topics' => (int) $r->topics];
+        }
+        return $this->json(['ok' => true, 'op' => 'forum.listCategories', 'categories' => $cats]);
+    }
+
+    /**
+     * Create a topic. Optionally broadcast it to ~all family members.
+     *
+     * Required: title, body, category, author (XREF, e.g. "I1092").
+     * Optional:
+     *   broadcast        — "0" to skip the broadcast (default "1")
+     *   attachment[]     — multipart-uploaded files (same field name the forum form uses)
+     *   attachment_paths — JSON array (or comma-separated) of absolute paths to files
+     *                      already placed on the server (FTP/SSH); they are MOVED
+     *                      into the canonical forum_attachments/<sub>/<name> location.
+     *
+     * Returns: { ok, topic_id, url, broadcast: {enqueued, sent, failed, remaining} | null }
+     *
+     * @param array<string,mixed> $params
+     */
+    private function forumPostTopic(Tree $tree, ServerRequestInterface $request, array $params): ResponseInterface
+    {
+        $this->requireForum();
+
+        $title    = $this->cleanLine((string) ($params['title'] ?? ''));
+        $body     = $this->clean((string) ($params['body'] ?? ''));
+        $category = $this->cleanLine((string) ($params['category'] ?? ''));
+        $author   = $this->cleanLine((string) ($params['author'] ?? $params['authorXref'] ?? ''));
+        $broadcast = !isset($params['broadcast']) || (string) $params['broadcast'] === '1' || $params['broadcast'] === true;
+
+        if ($title === '' || $body === '' || $category === '' || $author === '') {
+            return $this->json([
+                'ok' => false,
+                'error' => 'forum.postTopic requires title, body, category, author',
+            ], StatusCodeInterface::STATUS_BAD_REQUEST);
+        }
+        if (mb_strlen($title) > self::FORUM_TITLE_MAX) {
+            return $this->json([
+                'ok' => false,
+                'error' => 'title too long (max ' . self::FORUM_TITLE_MAX . ' chars)',
+            ], StatusCodeInterface::STATUS_BAD_REQUEST);
+        }
+
+        $creator = new \Fisharebest\Webtrees\ForumTopicCreator();
+        if (!$creator->xrefExistsInUsers($author)) {
+            return $this->json([
+                'ok' => false,
+                'error' => 'author XREF "' . $author . '" does not match any family member',
+            ], StatusCodeInterface::STATUS_BAD_REQUEST);
+        }
+
+        // Attachments BEFORE topic create, so a fatal mid-upload doesn't leave an empty topic.
+        try {
+            $attachments = $this->forumIngestAttachments($request, $params);
+        } catch (\Throwable $e) {
+            return $this->json(['ok' => false, 'error' => 'attachment ingest failed: ' . $e->getMessage()], StatusCodeInterface::STATUS_BAD_REQUEST);
+        }
+        $attachment_urls  = array_column($attachments, 'url');
+        $attachment_paths = array_column($attachments, 'path');
+        $body_for_topic   = $body;
+        foreach ($attachment_urls as $u) {
+            $body_for_topic .= "\n\n———\nAttachment: " . $u;
+        }
+
+        try {
+            $topic_id = $creator->createTopic($title, $body_for_topic, $category, $author);
+        } catch (\Throwable $e) {
+            foreach ($attachment_paths as $p) {
+                if (is_string($p) && is_file($p)) {
+                    @unlink($p);
+                    @rmdir(dirname($p));
+                }
+            }
+            return $this->json(['ok' => false, 'error' => 'createTopic failed: ' . $e->getMessage()], StatusCodeInterface::STATUS_INTERNAL_SERVER_ERROR);
+        }
+
+        $url = route(\Fisharebest\Webtrees\Module\ForumModule::class . ':viewTopic', [
+            'tree' => $tree->name(),
+            'topicId' => $topic_id,
+        ]);
+
+        $bcast_result = null;
+        if ($broadcast) {
+            try {
+                (new \Fisharebest\Webtrees\ForumMailer($tree))
+                    ->broadcastTopic($topic_id, $category, $title, $body_for_topic, $author, $attachment_urls, $attachment_paths);
+                // Counts from outbox.
+                $bcast_result = $this->forumOutboxCounts($topic_id);
+            } catch (\Throwable $e) {
+                $bcast_result = ['error' => $e->getMessage()];
+            }
+        }
+
+        return $this->json([
+            'ok' => true,
+            'op' => 'forum.postTopic',
+            'topic_id' => $topic_id,
+            'url' => $url,
+            'author' => $author,
+            'category' => $category,
+            'attachments' => count($attachments),
+            'broadcast' => $bcast_result,
+        ]);
+    }
+
+    /**
+     * Append a comment to an existing topic. Optionally notifies prior
+     * participants (mirrors the in-app reply flow).
+     *
+     * Required: topic_id, text, author (XREF).
+     * Optional: notify (default "1"), attachment[], attachment_paths.
+     *
+     * @param array<string,mixed> $params
+     */
+    private function forumAddComment(Tree $tree, ServerRequestInterface $request, array $params): ResponseInterface
+    {
+        $this->requireForum();
+
+        $topic_id = (int) ($params['topic_id'] ?? $params['topicId'] ?? 0);
+        $text     = $this->clean((string) ($params['text'] ?? ''));
+        $author   = $this->cleanLine((string) ($params['author'] ?? $params['authorXref'] ?? ''));
+        $notify   = !isset($params['notify']) || (string) $params['notify'] === '1' || $params['notify'] === true;
+
+        if ($topic_id <= 0 || $text === '' || $author === '') {
+            return $this->json([
+                'ok' => false,
+                'error' => 'forum.addComment requires topic_id, text, author',
+            ], StatusCodeInterface::STATUS_BAD_REQUEST);
+        }
+
+        $creator = new \Fisharebest\Webtrees\ForumTopicCreator();
+        if (!$creator->xrefExistsInUsers($author)) {
+            return $this->json([
+                'ok' => false,
+                'error' => 'author XREF "' . $author . '" does not match any family member',
+            ], StatusCodeInterface::STATUS_BAD_REQUEST);
+        }
+
+        // Verify topic exists. Raw SQL because forum tables skip the wt_ prefix.
+        $exists = DB::select('SELECT 1 FROM meran_forum_topics WHERE topic_id = ? LIMIT 1', [$topic_id]);
+        if (empty($exists)) {
+            return $this->json(['ok' => false, 'error' => 'topic ' . $topic_id . ' not found'], StatusCodeInterface::STATUS_NOT_FOUND);
+        }
+
+        try {
+            $attachments = $this->forumIngestAttachments($request, $params);
+        } catch (\Throwable $e) {
+            return $this->json(['ok' => false, 'error' => 'attachment ingest failed: ' . $e->getMessage()], StatusCodeInterface::STATUS_BAD_REQUEST);
+        }
+        $attachment_urls = array_column($attachments, 'url');
+        $body_for_comment = $text;
+        foreach ($attachment_urls as $u) {
+            $body_for_comment .= "\n\n———\nAttachment: " . $u;
+        }
+
+        try {
+            $message_id = $creator->addComment($topic_id, $body_for_comment, $author);
+        } catch (\Throwable $e) {
+            return $this->json(['ok' => false, 'error' => 'addComment failed: ' . $e->getMessage()], StatusCodeInterface::STATUS_INTERNAL_SERVER_ERROR);
+        }
+
+        $url = route(\Fisharebest\Webtrees\Module\ForumModule::class . ':viewTopic', [
+            'tree' => $tree->name(),
+            'topicId' => $topic_id,
+        ]) . '#m' . $message_id;
+
+        $notify_result = null;
+        if ($notify) {
+            try {
+                (new \Fisharebest\Webtrees\ForumMailer($tree))
+                    ->notifyReply($topic_id, $body_for_comment, $author);
+                $notify_result = 'sent';
+            } catch (\Throwable $e) {
+                $notify_result = ['error' => $e->getMessage()];
+            }
+        }
+
+        return $this->json([
+            'ok' => true,
+            'op' => 'forum.addComment',
+            'topic_id' => $topic_id,
+            'message_id' => $message_id,
+            'url' => $url,
+            'attachments' => count($attachments),
+            'notify' => $notify_result,
+        ]);
+    }
+
+    /**
+     * Delete a topic and ALL of its comments. Admin-only by virtue of the API
+     * token; no per-user ownership check.
+     *
+     * @param array<string,mixed> $params
+     */
+    private function forumDeleteTopic(array $params): ResponseInterface
+    {
+        $this->requireForum();
+        $topic_id = (int) ($params['topic_id'] ?? $params['topicId'] ?? 0);
+        if ($topic_id <= 0) {
+            return $this->json(['ok' => false, 'error' => 'topic_id required'], StatusCodeInterface::STATUS_BAD_REQUEST);
+        }
+
+        // Raw SQL: forum tables skip the wt_ prefix, so the query-builder would mis-prefix.
+        $row = DB::select('SELECT COUNT(*) AS c FROM meran_forum_comments WHERE topic_id = ?', [$topic_id]);
+        $comments = (int) ($row[0]->c ?? 0);
+        DB::statement('DELETE FROM meran_forum_comments WHERE topic_id = ?', [$topic_id]);
+        DB::statement('DELETE FROM meran_forum_outbox WHERE topic_id = ?', [$topic_id]);
+        $topic_deleted = DB::affectingStatement('DELETE FROM meran_forum_topics WHERE topic_id = ?', [$topic_id]);
+
+        return $this->json([
+            'ok' => true,
+            'op' => 'forum.deleteTopic',
+            'topic_id' => $topic_id,
+            'topic_deleted' => (int) $topic_deleted,
+            'comments_deleted' => $comments,
+        ]);
+    }
+
+    /**
+     * Delete a single comment. If it was the last one in its topic, the topic
+     * is removed too (mirrors ForumTopicCreator::deleteComment).
+     *
+     * @param array<string,mixed> $params
+     */
+    private function forumDeleteComment(array $params): ResponseInterface
+    {
+        $this->requireForum();
+        $message_id = (int) ($params['message_id'] ?? $params['messageId'] ?? 0);
+        if ($message_id <= 0) {
+            return $this->json(['ok' => false, 'error' => 'message_id required'], StatusCodeInterface::STATUS_BAD_REQUEST);
+        }
+        $res = (new \Fisharebest\Webtrees\ForumTopicCreator())->deleteComment($message_id);
+        return $this->json([
+            'ok' => true,
+            'op' => 'forum.deleteComment',
+            'message_id' => $message_id,
+            'topic_id' => $res['topic_id'] ?? 0,
+            'topic_deleted' => (bool) ($res['topic_deleted'] ?? false),
+        ]);
+    }
+
+    /**
+     * Ingest attachments from EITHER:
+     *   (a) multipart upload — field name "attachment" or "attachment[]"
+     *       (same name the forum form uses; one file or many);
+     *   (b) `attachment_paths` param — JSON-array or comma-separated list of
+     *       absolute server-side paths; the API moves them into the canonical
+     *       forum_attachments/<sub>/<name> location.
+     *
+     * Files exceeding the per-file size cap or with disallowed extensions are
+     * SKIPPED silently — the topic still goes through. (Matches the forum
+     * form's FlashMessage-warn-and-continue behaviour, except we have no Flash
+     * here.) If you want strict failure, set strict=1 in params.
+     *
+     * Returns: list of ['url'=>string, 'path'=>string], same shape as
+     * ForumModule::storeAttachments — directly consumable by ForumMailer.
+     *
+     * @param array<string,mixed> $params
+     * @return list<array{url:string,path:string}>
+     */
+    private function forumIngestAttachments(ServerRequestInterface $request, array $params): array
+    {
+        $out = [];
+        $strict = isset($params['strict']) && ((string) $params['strict'] === '1' || $params['strict'] === true);
+
+        // Where attachments live (relative to docroot/data/forum_attachments/).
+        $dataRoot = realpath(__DIR__ . '/../../data');
+        if ($dataRoot === false) {
+            throw new \RuntimeException('data/ not resolvable from api module');
+        }
+
+        // (a) multipart uploads
+        $files = $request->getUploadedFiles();
+        $raw   = $files['attachment'] ?? $files['datei'] ?? null;
+        if ($raw !== null) {
+            $list = is_array($raw) ? $raw : [$raw];
+            foreach ($list as $f) {
+                if (!$f instanceof \Psr\Http\Message\UploadedFileInterface) continue;
+                if ($f->getError() === UPLOAD_ERR_NO_FILE) continue;
+                $row = $this->forumStoreOneUploaded($f, $dataRoot, $strict);
+                if ($row !== null) $out[] = $row;
+            }
+        }
+
+        // (b) server-side paths
+        $paths_raw = $params['attachment_paths'] ?? $params['attachment_path'] ?? null;
+        if ($paths_raw !== null) {
+            $paths = [];
+            if (is_array($paths_raw)) {
+                $paths = $paths_raw;
+            } elseif (is_string($paths_raw) && $paths_raw !== '') {
+                // accept either JSON or comma-separated
+                $j = json_decode($paths_raw, true);
+                $paths = is_array($j) ? $j : array_map('trim', explode(',', $paths_raw));
+            }
+            foreach ($paths as $srcPath) {
+                $row = $this->forumStoreOnePath((string) $srcPath, $dataRoot, $strict);
+                if ($row !== null) $out[] = $row;
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * @return array{url:string,path:string}|null
+     */
+    private function forumStoreOneUploaded(\Psr\Http\Message\UploadedFileInterface $file, string $dataRoot, bool $strict): ?array
+    {
+        if ($file->getError() !== UPLOAD_ERR_OK) {
+            if ($strict) throw new \RuntimeException('upload error ' . $file->getError());
+            return null;
+        }
+        if ($file->getSize() > self::FORUM_MAX_ATTACHMENT_BYTES) {
+            if ($strict) throw new \RuntimeException('attachment exceeds size cap');
+            return null;
+        }
+        $name = $this->sanitiseAttachmentName((string) $file->getClientFilename());
+        if ($name === null) {
+            if ($strict) throw new \RuntimeException('invalid attachment name/extension');
+            return null;
+        }
+        [$sub, $dir, $target] = $this->forumAttachmentTarget($dataRoot, $name);
+        if ($target === null) {
+            if ($strict) throw new \RuntimeException('failed to allocate attachment dir');
+            return null;
+        }
+        $file->moveTo($target);
+        return [
+            'url'  => route(\Fisharebest\Webtrees\Module\ForumModule::class . ':attachmentPublic', ['sub' => $sub, 'name' => $name]),
+            'path' => $target,
+        ];
+    }
+
+    /**
+     * @return array{url:string,path:string}|null
+     */
+    private function forumStoreOnePath(string $srcPath, string $dataRoot, bool $strict): ?array
+    {
+        $real = realpath($srcPath);
+        if ($real === false || !is_file($real)) {
+            if ($strict) throw new \RuntimeException('source file not found: ' . $srcPath);
+            return null;
+        }
+        if (filesize($real) > self::FORUM_MAX_ATTACHMENT_BYTES) {
+            if ($strict) throw new \RuntimeException('attachment exceeds size cap');
+            return null;
+        }
+        $name = $this->sanitiseAttachmentName(basename($real));
+        if ($name === null) {
+            if ($strict) throw new \RuntimeException('invalid attachment name/extension');
+            return null;
+        }
+        [$sub, $dir, $target] = $this->forumAttachmentTarget($dataRoot, $name);
+        if ($target === null) {
+            if ($strict) throw new \RuntimeException('failed to allocate attachment dir');
+            return null;
+        }
+        // Prefer rename (atomic on same filesystem); fall back to copy.
+        if (!@rename($real, $target)) {
+            if (!@copy($real, $target)) {
+                if ($strict) throw new \RuntimeException('failed to place attachment in target dir');
+                return null;
+            }
+        }
+        return [
+            'url'  => route(\Fisharebest\Webtrees\Module\ForumModule::class . ':attachmentPublic', ['sub' => $sub, 'name' => $name]),
+            'path' => $target,
+        ];
+    }
+
+    /**
+     * Returns sanitised basename or null if rejected.
+     */
+    private function sanitiseAttachmentName(string $raw): ?string
+    {
+        $name = basename($raw);
+        $name = preg_replace('/[^A-Za-z0-9._-]/', '_', $name);
+        if ($name === null || $name === '' || $name[0] === '.') return null;
+        $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+        if ($ext === '' || !in_array($ext, self::FORUM_ALLOWED_EXTS, true)) return null;
+        return $name;
+    }
+
+    /**
+     * @return array{0:string,1:string,2:string|null}  [sub, dir, target] — target null on mkdir failure.
+     */
+    private function forumAttachmentTarget(string $dataRoot, string $name): array
+    {
+        $sub = bin2hex(random_bytes(8));
+        $dir = $dataRoot . '/forum_attachments/' . $sub;
+        if (!is_dir($dir) && !mkdir($dir, 0755, true) && !is_dir($dir)) {
+            return [$sub, $dir, null];
+        }
+        return [$sub, $dir, $dir . '/' . $name];
+    }
+
+    /**
+     * @return array{enqueued:int,sent:int,failed:int,remaining:int}
+     */
+    private function forumOutboxCounts(int $topic_id): array
+    {
+        // Fresh mysqli — the request's Eloquent connection holds a REPEATABLE READ
+        // snapshot from before ForumMailer's own mysqli wrote+committed the outbox
+        // rows, so DB::select() reads zeros. A new connection gets a current snapshot.
+        $c = parse_ini_file(__DIR__ . '/../../data/config.ini.php');
+        $by = ['queued' => 0, 'sending' => 0, 'sent' => 0, 'failed' => 0];
+        try {
+            $db = new \mysqli($c['dbhost'], $c['dbuser'], $c['dbpass'], $c['dbname'], (int) ($c['dbport'] ?? 3306));
+            if ($db->connect_errno) {
+                return ['enqueued' => 0, 'sent' => 0, 'failed' => 0, 'remaining' => 0, 'note' => 'count connect failed'];
+            }
+            $stmt = $db->prepare('SELECT status, COUNT(*) AS c FROM meran_forum_outbox WHERE topic_id = ? GROUP BY status');
+            $stmt->bind_param('i', $topic_id);
+            $stmt->execute();
+            $res = $stmt->get_result();
+            while ($row = $res->fetch_assoc()) {
+                $by[(string) $row['status']] = (int) $row['c'];
+            }
+            $stmt->close();
+            $db->close();
+        } catch (\Throwable $e) {
+            return ['enqueued' => 0, 'sent' => 0, 'failed' => 0, 'remaining' => 0, 'note' => 'count error: ' . $e->getMessage()];
+        }
+        return [
+            'enqueued'  => array_sum($by),
+            'sent'      => $by['sent'],
+            'failed'    => $by['failed'],
+            'remaining' => $by['queued'] + $by['sending'],
+        ];
     }
 }
