@@ -203,6 +203,21 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
                 case 'forum.deleteComment':
                     return $this->forumDeleteComment($params);
 
+                case 'pending.list':
+                    return $this->pendingList($tree, $params);
+
+                case 'pending.acceptAll':
+                    return $this->pendingAcceptAll($tree, $pcs);
+
+                case 'pending.rejectAll':
+                    return $this->pendingRejectAll($tree, $pcs);
+
+                case 'pending.accept':
+                    return $this->pendingAccept($tree, $pcs, $params);
+
+                case 'pending.reject':
+                    return $this->pendingReject($tree, $pcs, $params);
+
                 default:
                     return $this->json(['ok' => false, 'error' => 'unknown op: ' . $op], StatusCodeInterface::STATUS_BAD_REQUEST);
             }
@@ -906,6 +921,163 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
         }
 
         return $this->json(['ok' => true, 'filter' => $filter, 'count' => count($out), 'users' => $out]);
+    }
+
+    // ─────────────────────────── pending-changes ops ────────────────────
+
+    /**
+     * Count pending changes for a tree.
+     */
+    private function pendingCount(Tree $tree): int
+    {
+        return DB::table('change')
+            ->where('gedcom_id', '=', $tree->id())
+            ->where('status', '=', 'pending')
+            ->count();
+    }
+
+    /**
+     * List every pending (unapproved) change for the tree. One entry per change
+     * row, ordered oldest-first, with the record name, type, action, author and time.
+     *
+     * @param array<string,mixed> $params
+     */
+    private function pendingList(Tree $tree, array $params): ResponseInterface
+    {
+        $rows = DB::table('change')
+            ->leftJoin('user', 'user.user_id', '=', 'change.user_id')
+            ->where('change.gedcom_id', '=', $tree->id())
+            ->where('change.status', '=', 'pending')
+            ->orderBy('change.change_id')
+            ->select([
+                'change.change_id',
+                'change.xref',
+                'change.old_gedcom',
+                'change.new_gedcom',
+                'change.change_time',
+                'user.user_name',
+                'user.real_name',
+            ])
+            ->get();
+
+        $out   = [];
+        $xrefs = [];
+        foreach ($rows as $r) {
+            $old = (string) $r->old_gedcom;
+            $new = (string) $r->new_gedcom;
+
+            $action = $new === '' ? 'delete' : ($old === '' ? 'create' : 'update');
+
+            preg_match('/^0 (?:@[^@]+@ )?(\w+)/', $old . "\n" . $new, $m);
+            $type = $m[1] ?? '';
+
+            $record = Registry::gedcomRecordFactory()->make($r->xref, $tree);
+            $name   = $record !== null ? trim(strip_tags($record->fullName())) : '';
+
+            $xrefs[$r->xref] = true;
+
+            $out[] = [
+                'change_id'   => (int) $r->change_id,
+                'xref'        => (string) $r->xref,
+                'type'        => $type,
+                'action'      => $action,
+                'name'        => $name,
+                'user_name'   => (string) ($r->user_name ?? ''),
+                'real_name'   => (string) ($r->real_name ?? ''),
+                'change_time' => (string) $r->change_time,
+            ];
+        }
+
+        return $this->json([
+            'ok'      => true,
+            'op'      => 'pending.list',
+            'count'   => count($out),
+            'records' => count($xrefs),
+            'changes' => $out,
+        ]);
+    }
+
+    /**
+     * Approve EVERY pending change for the tree, in change order. Goes through
+     * webtrees' PendingChangesService so the gedcom records + wt_name/wt_link
+     * indexes stay consistent (same path as the admin "accept all" button).
+     */
+    private function pendingAcceptAll(Tree $tree, PendingChangesService $pcs): ResponseInterface
+    {
+        $before  = $this->pendingCount($tree);
+        $records = DB::table('change')
+            ->where('gedcom_id', '=', $tree->id())
+            ->where('status', '=', 'pending')
+            ->distinct()
+            ->count('xref');
+
+        $pcs->acceptTree($tree, PHP_INT_MAX);
+
+        $remaining = $this->pendingCount($tree);
+
+        return $this->json([
+            'ok'             => true,
+            'op'             => 'pending.acceptAll',
+            'accepted'       => $before - $remaining,
+            'records'        => $records,
+            'pending_before' => $before,
+            'remaining'      => $remaining,
+        ]);
+    }
+
+    /**
+     * Reject (discard) EVERY pending change for the tree.
+     */
+    private function pendingRejectAll(Tree $tree, PendingChangesService $pcs): ResponseInterface
+    {
+        $before = $this->pendingCount($tree);
+
+        $pcs->rejectTree($tree);
+
+        $remaining = $this->pendingCount($tree);
+
+        return $this->json([
+            'ok'        => true,
+            'op'        => 'pending.rejectAll',
+            'rejected'  => $before - $remaining,
+            'remaining' => $remaining,
+        ]);
+    }
+
+    /**
+     * Approve all pending changes for one record (by xref).
+     *
+     * @param array<string,mixed> $params
+     */
+    private function pendingAccept(Tree $tree, PendingChangesService $pcs, array $params): ResponseInterface
+    {
+        $xref   = $this->clean((string) ($params['xref'] ?? ''));
+        $record = $xref === '' ? null : Registry::gedcomRecordFactory()->make($xref, $tree);
+        if ($record === null) {
+            return $this->json(['ok' => false, 'error' => 'record not found: ' . $xref], StatusCodeInterface::STATUS_BAD_REQUEST);
+        }
+
+        $pcs->acceptRecord($record);
+
+        return $this->json(['ok' => true, 'op' => 'pending.accept', 'xref' => $xref]);
+    }
+
+    /**
+     * Reject all pending changes for one record (by xref).
+     *
+     * @param array<string,mixed> $params
+     */
+    private function pendingReject(Tree $tree, PendingChangesService $pcs, array $params): ResponseInterface
+    {
+        $xref   = $this->clean((string) ($params['xref'] ?? ''));
+        $record = $xref === '' ? null : Registry::gedcomRecordFactory()->make($xref, $tree);
+        if ($record === null) {
+            return $this->json(['ok' => false, 'error' => 'record not found: ' . $xref], StatusCodeInterface::STATUS_BAD_REQUEST);
+        }
+
+        $pcs->rejectRecord($record);
+
+        return $this->json(['ok' => true, 'op' => 'pending.reject', 'xref' => $xref]);
     }
 
     // ───────────────────────────── helpers ─────────────────────────────

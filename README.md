@@ -200,6 +200,24 @@ By default an attachment that fails validation (wrong extension, too big, missin
 
 **`notify` on comments** — `notify=1` (default) calls `ForumMailer::notifyReply`, which emails only prior participants in that topic.
 
+### Pending changes (admin)
+
+Edits made by `edit`-role members go into webtrees' pending-changes queue and wait for a moderator. These ops list and clear that queue without using the web UI. They go through webtrees' own `PendingChangesService` (same path as the admin "accept all" button), so the gedcom records and the `wt_name` / `wt_link` indexes stay consistent.
+
+| op | params | does |
+| --- | --- | --- |
+| `pending.list` | — | list every pending change: `change_id`, `xref`, `type` (INDI/FAM/…), `action` (`create`/`update`/`delete`), record `name`, `user_name`, `real_name`, `change_time`. Returns `count` (changes) and `records` (distinct xrefs) |
+| `pending.acceptAll` | — | **approve every pending change** for the tree, in change order. Returns `{ accepted, records, pending_before, remaining }` |
+| `pending.rejectAll` | — | reject (discard) every pending change for the tree |
+| `pending.accept` | `xref` | approve all pending changes for one record |
+| `pending.reject` | `xref` | reject all pending changes for one record |
+
+```bash
+# see what's waiting, then approve it all
+api --data-urlencode "op=pending.list"
+api --data-urlencode "op=pending.acceptAll"
+```
+
 ---
 
 ## 5. Examples
