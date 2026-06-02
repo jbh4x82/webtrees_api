@@ -18,6 +18,9 @@ use Fisharebest\Webtrees\Registry;
 use Fisharebest\Webtrees\Tree;
 use Fisharebest\Webtrees\Services\PendingChangesService;
 use Fisharebest\Webtrees\Services\UserService;
+use Fisharebest\Webtrees\Services\EmailService;
+use Fisharebest\Webtrees\SiteUser;
+use Fisharebest\Webtrees\Validator;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\ServerRequestInterface;
 use Psr\Http\Server\RequestHandlerInterface;
@@ -126,7 +129,7 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
                     return $this->userLookup($user_service, $tree, $params);
 
                 case 'user.activate':
-                    return $this->userActivate($user_service, $tree, $params);
+                    return $this->userActivate($user_service, $tree, $params, $request);
 
                 case 'user.create':
                     return $this->userCreate($user_service, $params);
@@ -254,7 +257,7 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
      *
      * @param array<string,mixed> $params
      */
-    private function userActivate(UserService $user_service, Tree $tree, array $params): ResponseInterface
+    private function userActivate(UserService $user_service, Tree $tree, array $params, ServerRequestInterface $request): ResponseInterface
     {
         $user = $user_service->find((int) ($params['user_id'] ?? 0));
         if ($user === null) {
@@ -267,6 +270,12 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
             $role = 'edit';
         }
 
+        // Native approval-email transition: send only when the account was NOT
+        // previously admin-approved (mirrors core UserEditAction). Suppress with notify=0.
+        $was_approved = $user->getPreference(UserInterface::PREF_IS_ACCOUNT_APPROVED) === '1';
+        $notify       = !isset($params['notify']) || (string) $params['notify'] === '1' || $params['notify'] === true;
+        $approval_email = null;
+
         $user->setPreference('verified', '1');
         $user->setPreference('verified_by_admin', '1');
         $tree->setUserPreference($user, 'canedit', $role);
@@ -276,7 +285,32 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
             $tree->setUserPreference($user, 'rootid', $xref);
         }
 
-        return $this->json(['ok' => true, 'user' => $this->userInfo($user, $tree)]);
+        if ($was_approved) {
+            $approval_email = 'skipped (already approved)';
+        } elseif (!$notify) {
+            $approval_email = 'skipped (notify=0)';
+        } else {
+            // Exactly what core does in UserEditAction when an admin approves a user.
+            try {
+                I18N::init($user->getPreference(UserInterface::PREF_LANGUAGE, 'en-US'));
+                $base_url      = Validator::attributes($request)->string('base_url');
+                $email_service = Registry::container()->get(EmailService::class);
+                $ok = $email_service->send(
+                    new SiteUser(),
+                    $user,
+                    Auth::user(),
+                    /* I18N: %s is a server name/URL */
+                    I18N::translate('New user at %s', $base_url),
+                    view('emails/approve-user-text', ['user' => $user, 'base_url' => $base_url]),
+                    view('emails/approve-user-html', ['user' => $user, 'base_url' => $base_url])
+                );
+                $approval_email = $ok ? 'sent' : 'failed';
+            } catch (Throwable $e) {
+                $approval_email = ['error' => $e->getMessage()];
+            }
+        }
+
+        return $this->json(['ok' => true, 'approval_email' => $approval_email, 'user' => $this->userInfo($user, $tree)]);
     }
 
     /**
