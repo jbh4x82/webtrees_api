@@ -1292,11 +1292,18 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
      */
     private function indiInfo(Individual $indi): array
     {
+        $spouseFamilies = $indi->spouseFamilies()->map(static fn (Family $f): string => $f->xref())->all();
+        $childFamilies  = $indi->childFamilies()->map(static fn (Family $f): string => $f->xref())->all();
+
         return [
-            'xref'     => $indi->xref(),
-            'name'     => strip_tags($indi->fullName()),
-            'sex'      => $indi->sex(),
-            'families' => $indi->spouseFamilies()->map(static fn (Family $f): string => $f->xref())->all(),
+            'xref'            => $indi->xref(),
+            'name'            => strip_tags($indi->fullName()),
+            'sex'             => $indi->sex(),
+            // 'families' kept for backward compatibility = spouse families only.
+            // Use 'spouse_families' / 'child_families' for an unambiguous split.
+            'families'        => $spouseFamilies,
+            'spouse_families' => $spouseFamilies,
+            'child_families'  => $childFamilies,
         ];
     }
 

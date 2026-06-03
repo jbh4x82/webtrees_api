@@ -131,7 +131,7 @@ Every call needs `op=<operation>` plus the params below. `?` marks optional para
 | op | params | returns |
 |---|---|---|
 | `ping` | — | health check (tree + acting user) |
-| `individual.get` | `xref` | xref, name, sex, spouse-families |
+| `individual.get` | `xref` | xref, name, sex, `spouse_families`, `child_families` (`families` retained = spouse only, for back-compat) |
 | `family.get` | `xref` | husband, wife, children |
 | `record.facts` | `xref` | every fact of an individual/family with its **fact id** (needed to edit/delete a specific fact) |
 | `user.lookup` | `user_id` \| `email` \| `user_name` | user + tree role/link |
