@@ -133,6 +133,7 @@ Every call needs `op=<operation>` plus the params below. `?` marks optional para
 | `ping` | — | health check (tree + acting user) |
 | `individual.get` | `xref` | xref, name, sex, `spouse_families`, `child_families` (`families` retained = spouse only, for back-compat) |
 | `family.get` | `xref` | husband, wife, children |
+| `relationship.get` | `xref1`, `xref2`, `recursion?`, `ancestors?`, `max_paths?`, `lang?` | **all** relationship paths between two people — same engine as the web "Relationships" chart. Each result: `label` (e.g. "maternal grandfather"; reads *individual2 is the &lt;label&gt; of individual1*), `generations`, and the full `path` of alternating INDI/FAM nodes. `recursion` (default = tree's `RELATIONSHIP_RECURSION`, 0 = shortest only) controls how many alternative paths are enumerated; `ancestors=1` restricts to common-ancestor paths; `max_paths` caps the response (default 25, sets `truncated`); `lang` picks the label language (default = UI language, falls back to English). |
 | `record.facts` | `xref` | every fact of an individual/family with its **fact id** (needed to edit/delete a specific fact) |
 | `user.lookup` | `user_id` \| `email` \| `user_name` | user + tree role/link |
 | `user.list` | `filter`=`all`\|`unverified`\|`unlinked`, `limit?` | list of users |

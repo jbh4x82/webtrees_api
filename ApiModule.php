@@ -19,11 +19,15 @@ use Fisharebest\Webtrees\Tree;
 use Fisharebest\Webtrees\Services\PendingChangesService;
 use Fisharebest\Webtrees\Services\UserService;
 use Fisharebest\Webtrees\Services\EmailService;
+use Fisharebest\Webtrees\Services\ModuleService;
+use Fisharebest\Webtrees\Services\RelationshipService;
+use Fisharebest\Webtrees\Services\TreeService;
 use Fisharebest\Webtrees\SiteUser;
 use Fisharebest\Webtrees\Validator;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\ServerRequestInterface;
 use Psr\Http\Server\RequestHandlerInterface;
+use ReflectionMethod;
 use Throwable;
 
 /**
@@ -163,6 +167,9 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
 
                 case 'family.get':
                     return $this->familyGet($tree, $params);
+
+                case 'relationship.get':
+                    return $this->relationshipGet($tree, $params);
 
                 case 'family.addEvent':
                     return $this->familyAddEvent($tree, $pcs, $params);
@@ -368,6 +375,159 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
         }
 
         return $this->json(['ok' => true, 'individual' => $this->indiInfo($indi)]);
+    }
+
+    /**
+     * All relationship paths between two individuals.
+     *
+     * Uses webtrees' own RelationshipsChartModule::calculateRelationships()
+     * (a Dijkstra over the FAMS/FAMC graph that returns every shortest path,
+     * plus alternative paths through other families up to `recursion`) and
+     * RelationshipService::nameFromPath() for the human-readable label of each.
+     * This is the same engine behind the "Relationships" chart in the web UI,
+     * so results match what a family member would see there — no raw SQL.
+     *
+     * Params:
+     *   xref1, xref2  (required) the two individuals
+     *   recursion     (int) how many alternative paths to enumerate beyond the
+     *                 shortest; defaults to the tree's RELATIONSHIP_RECURSION
+     *                 preference (99 = unlimited), capped at it. 0 = shortest only.
+     *   ancestors     (1) restrict to paths through a common ancestor.
+     *   max_paths     (int, default 25, cap 200) response size guard.
+     *   lang          (e.g. "en-GB", "de") label language; default = UI language,
+     *                 falling back to English.
+     *
+     * Each relationship's `label` reads: "individual2 is the <label> of individual1".
+     *
+     * @param array<string,mixed> $params
+     */
+    private function relationshipGet(Tree $tree, array $params): ResponseInterface
+    {
+        $xref1 = $this->clean((string) ($params['xref1'] ?? ''));
+        $xref2 = $this->clean((string) ($params['xref2'] ?? ''));
+
+        $i1 = Registry::individualFactory()->make($xref1, $tree);
+        $i2 = Registry::individualFactory()->make($xref2, $tree);
+        if ($i1 === null || $i2 === null) {
+            return $this->json(['ok' => false, 'error' => 'individual(s) not found']);
+        }
+
+        $language = $this->relationshipLanguage((string) ($params['lang'] ?? ''));
+
+        $brief = static fn (Individual $i): array => ['xref' => $i->xref(), 'name' => strip_tags($i->fullName())];
+
+        // Same person.
+        if ($xref1 === $xref2) {
+            return $this->json([
+                'ok'            => true,
+                'op'            => 'relationship.get',
+                'individual1'   => $brief($i1),
+                'individual2'   => $brief($i2),
+                'count'         => 1,
+                'truncated'     => false,
+                'closest'       => 'self',
+                'relationships' => [['label' => 'self', 'generations' => 0, 'path' => [$brief($i1) + ['type' => 'INDI']]]],
+            ]);
+        }
+
+        $tree_recursion = (int) $tree->getPreference('RELATIONSHIP_RECURSION', '99');
+        $recursion      = isset($params['recursion']) ? (int) $params['recursion'] : $tree_recursion;
+        $recursion      = max(0, min($recursion, $tree_recursion));
+
+        $ancestors = isset($params['ancestors']) && ((string) $params['ancestors'] === '1' || $params['ancestors'] === true);
+
+        $max_paths = (int) ($params['max_paths'] ?? 25);
+        $max_paths = max(1, min($max_paths, 200));
+
+        // Build the chart module directly (works regardless of enabled-state).
+        $relationship_service = Registry::container()->get(RelationshipService::class);
+        $tree_service         = Registry::container()->get(TreeService::class);
+        $chart                = new RelationshipsChartModule($relationship_service, $tree_service);
+
+        $method = new ReflectionMethod(RelationshipsChartModule::class, 'calculateRelationships');
+        $method->setAccessible(true);
+        // Returns array of paths; each path is an array of alternating
+        // INDI/FAM xref strings (node 0 = individual1 … last = individual2).
+        $paths = $method->invoke($chart, $i1, $i2, $recursion, $ancestors);
+
+        $relationships = [];
+        $truncated     = false;
+
+        foreach ($paths as $path_xrefs) {
+            if (count($relationships) >= $max_paths) {
+                $truncated = true;
+                break;
+            }
+
+            $nodes    = [];
+            $node_out = [];
+            $ok       = true;
+            foreach (array_values($path_xrefs) as $i => $x) {
+                $is_indi = ($i % 2 === 0);
+                $rec     = $is_indi
+                    ? Registry::individualFactory()->make((string) $x, $tree)
+                    : Registry::familyFactory()->make((string) $x, $tree);
+                if ($rec === null) {
+                    $ok = false;
+                    break;
+                }
+                $nodes[]    = $rec;
+                $node_out[] = ['xref' => (string) $x, 'name' => strip_tags($rec->fullName()), 'type' => $is_indi ? 'INDI' : 'FAM'];
+            }
+            if (!$ok || $nodes === []) {
+                continue;
+            }
+
+            $label = $language !== null ? $relationship_service->nameFromPath($nodes, $language) : '';
+
+            $relationships[] = [
+                'label'       => $label,
+                'generations' => intdiv(count($node_out) - 1, 2), // number of family edges traversed
+                'path'        => $node_out,
+            ];
+        }
+
+        // Closest (fewest nodes) first.
+        usort($relationships, static fn (array $a, array $b): int => count($a['path']) <=> count($b['path']));
+
+        return $this->json([
+            'ok'            => true,
+            'op'            => 'relationship.get',
+            'individual1'   => $brief($i1),
+            'individual2'   => $brief($i2),
+            'reading'       => 'label = individual2 is the <label> of individual1',
+            'count'         => count($relationships),
+            'truncated'     => $truncated,
+            'closest'       => $relationships[0]['label'] ?? '',
+            'relationships' => $relationships,
+        ]);
+    }
+
+    /**
+     * Pick a language module for relationship labels: requested `lang`, else the
+     * current UI language, else English, else whatever exists.
+     */
+    private function relationshipLanguage(string $tag): ?ModuleLanguageInterface
+    {
+        $modules = Registry::container()->get(ModuleService::class)
+            ->findByInterface(ModuleLanguageInterface::class, true);
+
+        $pick = static fn (string $t): ?ModuleLanguageInterface => $modules
+            ->first(static fn (ModuleLanguageInterface $l): bool => $l->locale()->languageTag() === $t);
+
+        if ($tag !== '' && ($m = $pick($tag)) !== null) {
+            return $m;
+        }
+        if (($m = $pick(I18N::languageTag())) !== null) {
+            return $m;
+        }
+        foreach (['en-GB', 'en-US', 'en'] as $t) {
+            if (($m = $pick($t)) !== null) {
+                return $m;
+            }
+        }
+
+        return $modules->first();
     }
 
     /**
