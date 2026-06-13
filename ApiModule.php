@@ -451,6 +451,39 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
             ]);
         }
 
+        $relationship_service = Registry::container()->get(RelationshipService::class);
+
+        // FAST PATH — direct lineal relationship (ancestor / descendant) first.
+        // A cheap parent-chain BFS; no all-paths search. This is what lets deep
+        // royal/legendary lineages (e.g. Zeus 91 gens up) return instantly instead
+        // of timing out. Only NON-lineal (collateral) pairs fall through to the
+        // expensive Dijkstra search below. Skip with &lineal=0.
+        $skip_lineal = isset($params['lineal']) && (string) $params['lineal'] === '0';
+        if (!$skip_lineal) {
+            $lineal = $this->linealAncestorPath($i1, $i2);          // i2 is an ancestor of i1
+            if ($lineal === null) {
+                $down = $this->linealAncestorPath($i2, $i1);        // i1 is an ancestor of i2
+                if ($down !== null) {
+                    $lineal = array_reverse($down);                 // orient as i1 … i2
+                }
+            }
+            if ($lineal !== null) {
+                $entry = $this->relEntryFromNodes($lineal, $language, $relationship_service);
+                return $this->json([
+                    'ok'            => true,
+                    'op'            => 'relationship.get',
+                    'method'        => 'lineal',
+                    'individual1'   => $brief($i1),
+                    'individual2'   => $brief($i2),
+                    'reading'       => 'label = individual2 is the <label> of individual1',
+                    'count'         => 1,
+                    'truncated'     => false,
+                    'closest'       => $entry['label'],
+                    'relationships' => [$entry],
+                ]);
+            }
+        }
+
         $tree_recursion = (int) $tree->getPreference('RELATIONSHIP_RECURSION', '99');
         $recursion      = isset($params['recursion']) ? (int) $params['recursion'] : $tree_recursion;
         $recursion      = max(0, min($recursion, $tree_recursion));
@@ -460,8 +493,7 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
         $max_paths = (int) ($params['max_paths'] ?? 25);
         $max_paths = max(1, min($max_paths, 200));
 
-        // Build the chart module directly (works regardless of enabled-state).
-        $relationship_service = Registry::container()->get(RelationshipService::class);
+        // Collateral fallback: build the chart module directly (works regardless of enabled-state).
         $tree_service         = Registry::container()->get(TreeService::class);
         $chart                = new RelationshipsChartModule($relationship_service, $tree_service);
 
@@ -480,9 +512,8 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
                 break;
             }
 
-            $nodes    = [];
-            $node_out = [];
-            $ok       = true;
+            $nodes = [];
+            $ok    = true;
             foreach (array_values($path_xrefs) as $i => $x) {
                 $is_indi = ($i % 2 === 0);
                 $rec     = $is_indi
@@ -493,47 +524,12 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
                     break;
                 }
                 $nodes[] = $rec;
-                if ($is_indi) {
-                    $node_out[] = [
-                        'xref'  => (string) $x,
-                        'name'  => strip_tags($rec->fullName()),
-                        'type'  => 'INDI',
-                        'sex'   => $rec->sex(),
-                        'birth' => $yr($rec->getBirthDate()),
-                        'death' => $yr($rec->getDeathDate()),
-                    ];
-                } else {
-                    $node_out[] = ['xref' => (string) $x, 'name' => strip_tags($rec->fullName()), 'type' => 'FAM'];
-                }
             }
             if (!$ok || $nodes === []) {
                 continue;
             }
 
-            $label = $language !== null ? $relationship_service->nameFromPath($nodes, $language) : '';
-
-            // Walk just the individuals (even indices) and label how each
-            // connects to the previous one (father/mother/son/daughter/spouse/sibling).
-            $lineage = [];
-            for ($n = 0; $n < count($nodes); $n += 2) {
-                $ind   = $nodes[$n];
-                $entry = [
-                    'xref'                 => $ind->xref(),
-                    'name'                 => strip_tags($ind->fullName()),
-                    'sex'                  => $ind->sex(),
-                    'birth'                => $yr($ind->getBirthDate()),
-                    'death'                => $yr($ind->getDeathDate()),
-                    'relation_to_previous' => $n >= 2 ? $this->stepRelation($nodes[$n - 2], $nodes[$n - 1], $ind) : null,
-                ];
-                $lineage[] = $entry;
-            }
-
-            $relationships[] = [
-                'label'       => $label,
-                'generations' => intdiv(count($node_out) - 1, 2), // number of family edges traversed
-                'path'        => $node_out,
-                'lineage'     => $lineage,
-            ];
+            $relationships[] = $this->relEntryFromNodes($nodes, $language, $relationship_service);
         }
 
         // Closest (fewest nodes) first.
@@ -550,6 +546,124 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
             'closest'       => $relationships[0]['label'] ?? '',
             'relationships' => $relationships,
         ]);
+    }
+
+    /** Year out of a webtrees Date (null when unknown). */
+    private function dateYear($date): ?int
+    {
+        if ($date === null || !$date->isOK()) {
+            return null;
+        }
+        $y = (int) $date->minimumDate()->year();
+        return $y !== 0 ? $y : null;
+    }
+
+    /**
+     * Build a relationship entry (label + generations + path + lineage) from an
+     * ordered array of alternating INDI/FAM records (node 0 = individual1 …
+     * last = individual2). Shared by the lineal fast path and the collateral search.
+     *
+     * @param array<int,GedcomRecord>      $nodes
+     */
+    private function relEntryFromNodes(array $nodes, ?ModuleLanguageInterface $language, RelationshipService $rs): array
+    {
+        $node_out = [];
+        foreach ($nodes as $i => $rec) {
+            if ($i % 2 === 0) {
+                $node_out[] = [
+                    'xref'  => $rec->xref(),
+                    'name'  => strip_tags($rec->fullName()),
+                    'type'  => 'INDI',
+                    'sex'   => $rec->sex(),
+                    'birth' => $this->dateYear($rec->getBirthDate()),
+                    'death' => $this->dateYear($rec->getDeathDate()),
+                ];
+            } else {
+                $node_out[] = ['xref' => $rec->xref(), 'name' => strip_tags($rec->fullName()), 'type' => 'FAM'];
+            }
+        }
+
+        $label = $language !== null ? $rs->nameFromPath($nodes, $language) : '';
+
+        $lineage = [];
+        for ($n = 0; $n < count($nodes); $n += 2) {
+            $ind       = $nodes[$n];
+            $lineage[] = [
+                'xref'                 => $ind->xref(),
+                'name'                 => strip_tags($ind->fullName()),
+                'sex'                  => $ind->sex(),
+                'birth'                => $this->dateYear($ind->getBirthDate()),
+                'death'                => $this->dateYear($ind->getDeathDate()),
+                'relation_to_previous' => $n >= 2 ? $this->stepRelation($nodes[$n - 2], $nodes[$n - 1], $ind) : null,
+            ];
+        }
+
+        return [
+            'label'       => $label,
+            'generations' => intdiv(count($node_out) - 1, 2),
+            'path'        => $node_out,
+            'lineage'     => $lineage,
+        ];
+    }
+
+    /**
+     * Cheap lineal-only search: is `$to` a direct ANCESTOR of `$from`? BFS up the
+     * parent chain (FAMC → spouses) only — no collateral exploration, so it can't
+     * blow up the way the all-paths search does on deep pedigrees. Returns the
+     * alternating [INDI, FAM, INDI, …, INDI] records from `$from` up to `$to`,
+     * or null if `$to` is not a lineal ancestor.
+     *
+     * @return array<int,GedcomRecord>|null
+     */
+    private function linealAncestorPath(Individual $from, Individual $to, int $maxDepth = 400): ?array
+    {
+        $target = $to->xref();
+        if ($from->xref() === $target) {
+            return [$from];
+        }
+
+        $visited = [$from->xref() => true];
+        $prev    = [];                       // xref => [childIndi, viaFam]
+        $queue   = [$from];
+        $found   = false;
+
+        for ($d = 0; $d < $maxDepth && $queue !== [] && !$found; $d++) {
+            $next = [];
+            foreach ($queue as $indi) {
+                foreach ($indi->childFamilies() as $fam) {
+                    foreach ($fam->spouses() as $parent) {
+                        $px = $parent->xref();
+                        if (isset($visited[$px])) {
+                            continue;
+                        }
+                        $visited[$px] = true;
+                        $prev[$px]    = [$indi, $fam];
+                        if ($px === $target) {
+                            $found = true;
+                            break 3;
+                        }
+                        $next[] = $parent;
+                    }
+                }
+            }
+            $queue = $next;
+        }
+
+        if (!$found) {
+            return null;
+        }
+
+        // Reconstruct [to, fam, child, …, from] then reverse to [from … to].
+        $rev = [$to];
+        $cur = $target;
+        while ($cur !== $from->xref()) {
+            [$child, $fam] = $prev[$cur];
+            $rev[]         = $fam;
+            $rev[]         = $child;
+            $cur           = $child->xref();
+        }
+
+        return array_reverse($rev);
     }
 
     /**
