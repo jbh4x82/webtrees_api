@@ -414,7 +414,23 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
 
         $language = $this->relationshipLanguage((string) ($params['lang'] ?? ''));
 
-        $brief = static fn (Individual $i): array => ['xref' => $i->xref(), 'name' => strip_tags($i->fullName())];
+        // Year out of a webtrees Date (null when unknown).
+        $yr = static function ($date): ?int {
+            if ($date === null || !$date->isOK()) {
+                return null;
+            }
+            $y = (int) $date->minimumDate()->year();
+            return $y !== 0 ? $y : null;
+        };
+        $brief = static function (Individual $i) use ($yr): array {
+            return [
+                'xref'  => $i->xref(),
+                'name'  => strip_tags($i->fullName()),
+                'sex'   => $i->sex(),
+                'birth' => $yr($i->getBirthDate()),
+                'death' => $yr($i->getDeathDate()),
+            ];
+        };
 
         // Same person.
         if ($xref1 === $xref2) {
@@ -426,7 +442,12 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
                 'count'         => 1,
                 'truncated'     => false,
                 'closest'       => 'self',
-                'relationships' => [['label' => 'self', 'generations' => 0, 'path' => [$brief($i1) + ['type' => 'INDI']]]],
+                'relationships' => [[
+                    'label'       => 'self',
+                    'generations' => 0,
+                    'path'        => [$brief($i1) + ['type' => 'INDI']],
+                    'lineage'     => [$brief($i1) + ['relation_to_previous' => null]],
+                ]],
             ]);
         }
 
@@ -471,8 +492,19 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
                     $ok = false;
                     break;
                 }
-                $nodes[]    = $rec;
-                $node_out[] = ['xref' => (string) $x, 'name' => strip_tags($rec->fullName()), 'type' => $is_indi ? 'INDI' : 'FAM'];
+                $nodes[] = $rec;
+                if ($is_indi) {
+                    $node_out[] = [
+                        'xref'  => (string) $x,
+                        'name'  => strip_tags($rec->fullName()),
+                        'type'  => 'INDI',
+                        'sex'   => $rec->sex(),
+                        'birth' => $yr($rec->getBirthDate()),
+                        'death' => $yr($rec->getDeathDate()),
+                    ];
+                } else {
+                    $node_out[] = ['xref' => (string) $x, 'name' => strip_tags($rec->fullName()), 'type' => 'FAM'];
+                }
             }
             if (!$ok || $nodes === []) {
                 continue;
@@ -480,10 +512,27 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
 
             $label = $language !== null ? $relationship_service->nameFromPath($nodes, $language) : '';
 
+            // Walk just the individuals (even indices) and label how each
+            // connects to the previous one (father/mother/son/daughter/spouse/sibling).
+            $lineage = [];
+            for ($n = 0; $n < count($nodes); $n += 2) {
+                $ind   = $nodes[$n];
+                $entry = [
+                    'xref'                 => $ind->xref(),
+                    'name'                 => strip_tags($ind->fullName()),
+                    'sex'                  => $ind->sex(),
+                    'birth'                => $yr($ind->getBirthDate()),
+                    'death'                => $yr($ind->getDeathDate()),
+                    'relation_to_previous' => $n >= 2 ? $this->stepRelation($nodes[$n - 2], $nodes[$n - 1], $ind) : null,
+                ];
+                $lineage[] = $entry;
+            }
+
             $relationships[] = [
                 'label'       => $label,
                 'generations' => intdiv(count($node_out) - 1, 2), // number of family edges traversed
                 'path'        => $node_out,
+                'lineage'     => $lineage,
             ];
         }
 
@@ -501,6 +550,38 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
             'closest'       => $relationships[0]['label'] ?? '',
             'relationships' => $relationships,
         ]);
+    }
+
+    /**
+     * Label how `$cur` connects to `$prev` across the linking family `$fam`,
+     * sexed where possible (father/mother, son/daughter, brother/sister).
+     */
+    private function stepRelation(Individual $prev, Family $fam, Individual $cur): string
+    {
+        $childXrefs  = $fam->children()->map(static fn (Individual $c): string => $c->xref())->all();
+        $spouseXrefs = $fam->spouses()->map(static fn (Individual $s): string => $s->xref())->all();
+
+        $prevChild  = in_array($prev->xref(), $childXrefs, true);
+        $prevSpouse = in_array($prev->xref(), $spouseXrefs, true);
+        $curChild   = in_array($cur->xref(), $childXrefs, true);
+        $curSpouse  = in_array($cur->xref(), $spouseXrefs, true);
+
+        $sex = $cur->sex();
+
+        if ($prevChild && $curSpouse) {
+            return $sex === 'M' ? 'father' : ($sex === 'F' ? 'mother' : 'parent');
+        }
+        if ($prevSpouse && $curChild) {
+            return $sex === 'M' ? 'son' : ($sex === 'F' ? 'daughter' : 'child');
+        }
+        if ($prevSpouse && $curSpouse) {
+            return 'spouse';
+        }
+        if ($prevChild && $curChild) {
+            return $sex === 'M' ? 'brother' : ($sex === 'F' ? 'sister' : 'sibling');
+        }
+
+        return 'relative';
     }
 
     /**
