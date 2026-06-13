@@ -482,6 +482,24 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
                     'relationships' => [$entry],
                 ]);
             }
+
+            // SECOND FAST PATH — nearest common ancestor (collateral: cousins, uncles…).
+            $ca = $this->commonAncestorPath($i1, $i2);
+            if ($ca !== null) {
+                $entry = $this->relEntryFromNodes($ca, $language, $relationship_service);
+                return $this->json([
+                    'ok'            => true,
+                    'op'            => 'relationship.get',
+                    'method'        => 'common-ancestor',
+                    'individual1'   => $brief($i1),
+                    'individual2'   => $brief($i2),
+                    'reading'       => 'label = individual2 is the <label> of individual1',
+                    'count'         => 1,
+                    'truncated'     => false,
+                    'closest'       => $entry['label'],
+                    'relationships' => [$entry],
+                ]);
+            }
         }
 
         $tree_recursion = (int) $tree->getPreference('RELATIONSHIP_RECURSION', '99');
@@ -664,6 +682,87 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
         }
 
         return array_reverse($rev);
+    }
+
+    /**
+     * Map every ancestor of `$start` to its parent-pointer + depth, for cheap
+     * path reconstruction. xref => ['indi'=>obj,'child'=>obj|null,'fam'=>obj|null,'depth'=>int].
+     *
+     * @return array<string,array>
+     */
+    private function ancestorPaths(Individual $start, int $maxDepth = 400): array
+    {
+        $map   = [$start->xref() => ['indi' => $start, 'child' => null, 'fam' => null, 'depth' => 0]];
+        $queue = [$start];
+        for ($d = 0; $d < $maxDepth && $queue !== []; $d++) {
+            $next = [];
+            foreach ($queue as $indi) {
+                foreach ($indi->childFamilies() as $fam) {
+                    foreach ($fam->spouses() as $parent) {
+                        $px = $parent->xref();
+                        if (isset($map[$px])) {
+                            continue;
+                        }
+                        $map[$px] = ['indi' => $parent, 'child' => $indi, 'fam' => $fam, 'depth' => $d + 1];
+                        $next[]   = $parent;
+                    }
+                }
+            }
+            $queue = $next;
+        }
+        return $map;
+    }
+
+    /**
+     * Collateral relationship via the NEAREST common ancestor — cheap (two
+     * ancestor-set walks + intersection + path build), so cousins/uncles between
+     * deep pedigrees resolve without the all-paths Dijkstra timeout. Returns the
+     * alternating up-then-down path [i1 … commonAncestor … i2], or null if no
+     * common ancestor exists.
+     *
+     * @return array<int,GedcomRecord>|null
+     */
+    private function commonAncestorPath(Individual $i1, Individual $i2): ?array
+    {
+        $a = $this->ancestorPaths($i1);
+        $b = $this->ancestorPaths($i2);
+
+        $bestX = null;
+        $bestScore = PHP_INT_MAX;
+        $bestMax   = PHP_INT_MAX;
+        foreach ($a as $x => $ea) {
+            if (!isset($b[$x])) {
+                continue;
+            }
+            $score = $ea['depth'] + $b[$x]['depth'];
+            $mx    = max($ea['depth'], $b[$x]['depth']);
+            if ($score < $bestScore || ($score === $bestScore && $mx < $bestMax)) {
+                $bestScore = $score;
+                $bestMax   = $mx;
+                $bestX     = $x;
+            }
+        }
+        if ($bestX === null) {
+            return null;
+        }
+
+        $up = static function (array $map, string $startX, string $caX): array {
+            $cur   = $caX;
+            $chain = [$map[$caX]['indi']];
+            while ($cur !== $startX) {
+                $e       = $map[$cur];
+                $chain[] = $e['fam'];
+                $chain[] = $e['child'];
+                $cur     = $e['child']->xref();
+            }
+            return array_reverse($chain); // [start … CA]
+        };
+
+        $p1   = $up($a, $i1->xref(), $bestX);          // [i1 … CA]
+        $p2   = $up($b, $i2->xref(), $bestX);          // [i2 … CA]
+        $down = array_slice(array_reverse($p2), 1);    // [fam … i2]
+
+        return array_merge($p1, $down);                // [i1 … CA, fam … i2]
     }
 
     /**
