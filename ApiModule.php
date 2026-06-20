@@ -192,6 +192,21 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
                 case 'family.delete':
                     return $this->familyDelete($tree, $pcs, $params);
 
+                case 'media.create':
+                    return $this->mediaCreate($tree, $pcs, $params);
+
+                case 'media.get':
+                    return $this->mediaGet($tree, $params);
+
+                case 'media.update':
+                    return $this->mediaUpdate($tree, $pcs, $params);
+
+                case 'media.delete':
+                    return $this->mediaDelete($tree, $pcs, $params);
+
+                case 'media.link':
+                    return $this->mediaLink($tree, $pcs, $params);
+
                 case 'record.facts':
                     return $this->recordFacts($tree, $params);
 
@@ -1955,6 +1970,242 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
             'canedit'           => $tree->getUserPreference($user, 'canedit'),
             'gedcomid'          => $tree->getUserPreference($user, UserInterface::PREF_TREE_ACCOUNT_XREF),
         ];
+    }
+
+    // ───────────────────────────── media ops ─────────────────────────────
+
+    /**
+     * Create a media object and optionally link it to a record. Supply the image
+     * as `file_url` (downloaded server-side into the tree's media folder) or
+     * `file` (a filename already present there).
+     *
+     * Params: title?, file_url? | file?, filename?(desired name), link_xref?
+     *
+     * @param array<string,mixed> $params
+     */
+    private function mediaCreate(Tree $tree, PendingChangesService $pcs, array $params): ResponseInterface
+    {
+        $title    = $this->clean((string) ($params['title'] ?? ''));
+        $file_url = trim((string) ($params['file_url'] ?? ''));
+        $filename = $this->mediaSafeName((string) ($params['filename'] ?? ''));
+        $fs       = $tree->mediaFilesystem();
+
+        if ($file_url !== '') {
+            if (!preg_match('#^https?://#i', $file_url)) {
+                return $this->json(['ok' => false, 'error' => 'file_url must be http(s)']);
+            }
+            $bytes = $this->fetchUrl($file_url);
+            if ($bytes === null) {
+                return $this->json(['ok' => false, 'error' => 'could not download file_url']);
+            }
+            if ($filename === '') {
+                $base     = $this->mediaSafeName($title !== '' ? $title : 'media');
+                $filename = ($base !== '' ? $base : 'media') . '-' . substr(md5($file_url), 0, 8) . '.' . $this->extFromUrl($file_url);
+            }
+            $fs->write($filename, $bytes);
+        } else {
+            $filename = $this->mediaSafeName((string) ($params['file'] ?? ''));
+            if ($filename === '') {
+                return $this->json(['ok' => false, 'error' => 'file_url or file required']);
+            }
+            if (!$fs->fileExists($filename)) {
+                return $this->json(['ok' => false, 'error' => 'file not found in media folder: ' . $filename]);
+            }
+        }
+
+        $form   = strtolower(pathinfo($filename, PATHINFO_EXTENSION)) ?: 'jpg';
+        $gedcom = "0 @@ OBJE\n1 FILE " . $filename . "\n2 FORM " . $form;
+        if ($title !== '') {
+            $gedcom .= "\n2 TITL " . $title;
+        }
+        $media = $tree->createMediaObject($gedcom);
+        $pcs->acceptRecord($media);
+
+        $linked    = null;
+        $link_xref = $this->clean((string) ($params['link_xref'] ?? ''));
+        if ($link_xref !== '') {
+            $linked = $this->linkMedia($tree, $pcs, $link_xref, $media->xref()) ? $link_xref : null;
+        }
+
+        return $this->json([
+            'ok'     => true,
+            'op'     => 'media.create',
+            'media'  => $media->xref(),
+            'file'   => $filename,
+            'title'  => $title,
+            'linked' => $linked,
+        ]);
+    }
+
+    /**
+     * @param array<string,mixed> $params
+     */
+    private function mediaGet(Tree $tree, array $params): ResponseInterface
+    {
+        $media = Registry::mediaFactory()->make($this->clean((string) ($params['xref'] ?? '')), $tree);
+        if ($media === null) {
+            return $this->json(['ok' => false, 'error' => 'media not found']);
+        }
+
+        $files = [];
+        foreach ($media->mediaFiles() as $mf) {
+            $files[] = ['file' => $mf->filename(), 'title' => $mf->title(), 'format' => $mf->format()];
+        }
+        $linked = [];
+        foreach ($media->linkedIndividuals('OBJE') as $i) {
+            $linked[] = $i->xref();
+        }
+        foreach ($media->linkedFamilies('OBJE') as $f) {
+            $linked[] = $f->xref();
+        }
+
+        return $this->json([
+            'ok'     => true,
+            'op'     => 'media.get',
+            'xref'   => $media->xref(),
+            'files'  => $files,
+            'linked' => $linked,
+        ]);
+    }
+
+    /**
+     * Replace a media object's title and/or its image file (via `file_url`).
+     *
+     * @param array<string,mixed> $params
+     */
+    private function mediaUpdate(Tree $tree, PendingChangesService $pcs, array $params): ResponseInterface
+    {
+        $media = Registry::mediaFactory()->make($this->clean((string) ($params['xref'] ?? '')), $tree);
+        if ($media === null) {
+            return $this->json(['ok' => false, 'error' => 'media not found']);
+        }
+
+        $mf       = $media->mediaFiles()[0] ?? null;
+        $filename = $mf !== null ? $mf->filename() : '';
+        $title    = array_key_exists('title', $params)
+            ? $this->clean((string) $params['title'])
+            : ($mf !== null ? $mf->title() : '');
+
+        $file_url = trim((string) ($params['file_url'] ?? ''));
+        if ($file_url !== '') {
+            if (!preg_match('#^https?://#i', $file_url)) {
+                return $this->json(['ok' => false, 'error' => 'file_url must be http(s)']);
+            }
+            $bytes = $this->fetchUrl($file_url);
+            if ($bytes === null) {
+                return $this->json(['ok' => false, 'error' => 'could not download file_url']);
+            }
+            if ($filename === '') {
+                $filename = $this->mediaSafeName($title !== '' ? $title : 'media') . '-' . substr(md5($file_url), 0, 8) . '.' . $this->extFromUrl($file_url);
+            }
+            $tree->mediaFilesystem()->write($filename, $bytes);
+        }
+
+        $form   = strtolower(pathinfo($filename, PATHINFO_EXTENSION)) ?: 'jpg';
+        $gedcom = '0 @' . $media->xref() . "@ OBJE\n1 FILE " . $filename . "\n2 FORM " . $form;
+        if ($title !== '') {
+            $gedcom .= "\n2 TITL " . $title;
+        }
+        $media->updateRecord($gedcom, false);
+        $pcs->acceptRecord(Registry::mediaFactory()->make($media->xref(), $tree));
+
+        return $this->json(['ok' => true, 'op' => 'media.update', 'media' => $media->xref(), 'file' => $filename, 'title' => $title]);
+    }
+
+    /**
+     * @param array<string,mixed> $params
+     */
+    private function mediaDelete(Tree $tree, PendingChangesService $pcs, array $params): ResponseInterface
+    {
+        $media = Registry::mediaFactory()->make($this->clean((string) ($params['xref'] ?? '')), $tree);
+        if ($media === null) {
+            return $this->json(['ok' => false, 'error' => 'media not found']);
+        }
+        $xref = $media->xref();
+        $media->deleteRecord();
+        $pcs->acceptRecord($media);
+
+        return $this->json(['ok' => true, 'op' => 'media.delete', 'deleted' => $xref]);
+    }
+
+    /**
+     * Link an existing media object to an individual or family.
+     *
+     * @param array<string,mixed> $params
+     */
+    private function mediaLink(Tree $tree, PendingChangesService $pcs, array $params): ResponseInterface
+    {
+        $media = Registry::mediaFactory()->make($this->clean((string) ($params['media_xref'] ?? '')), $tree);
+        if ($media === null) {
+            return $this->json(['ok' => false, 'error' => 'media_xref not found']);
+        }
+        $xref = $this->clean((string) ($params['xref'] ?? ''));
+        if (!$this->linkMedia($tree, $pcs, $xref, $media->xref())) {
+            return $this->json(['ok' => false, 'error' => 'record (xref) not found']);
+        }
+
+        return $this->json(['ok' => true, 'op' => 'media.link', 'media' => $media->xref(), 'linked' => $xref]);
+    }
+
+    /** Add a `1 OBJE @media@` link to an individual/family and accept it. */
+    private function linkMedia(Tree $tree, PendingChangesService $pcs, string $xref, string $media_xref): bool
+    {
+        $rec = Registry::individualFactory()->make($xref, $tree)
+            ?? Registry::familyFactory()->make($xref, $tree);
+        if ($rec === null) {
+            return false;
+        }
+        $rec->createFact('1 OBJE @' . $media_xref . '@', false);
+        $fresh = Registry::individualFactory()->make($xref, $tree)
+            ?? Registry::familyFactory()->make($xref, $tree);
+        $pcs->acceptRecord($fresh);
+
+        return true;
+    }
+
+    /** Download a URL's contents (curl, then file_get_contents), or null. */
+    private function fetchUrl(string $url): ?string
+    {
+        $ua = 'abigfamily.org genealogy (webtrees module; contact johannes@bolzano.uk)';
+        if (function_exists('curl_init')) {
+            $ch = curl_init($url);
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_FOLLOWLOCATION => true,
+                CURLOPT_TIMEOUT        => 30,
+                CURLOPT_USERAGENT      => $ua,
+            ]);
+            $data = curl_exec($ch);
+            $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+            if (is_string($data) && $code >= 200 && $code < 300) {
+                return $data;
+            }
+        }
+        $ctx  = stream_context_create(['http' => ['timeout' => 30, 'header' => 'User-Agent: ' . $ua . "\r\n"]]);
+        $data = @file_get_contents($url, false, $ctx);
+
+        return $data === false ? null : $data;
+    }
+
+    /** File extension from a URL path (defaults to jpg). */
+    private function extFromUrl(string $url): string
+    {
+        $ext = strtolower(pathinfo((string) parse_url($url, PHP_URL_PATH), PATHINFO_EXTENSION));
+
+        return in_array($ext, ['jpg', 'jpeg', 'png', 'gif', 'webp'], true) ? $ext : 'jpg';
+    }
+
+    /** Filesystem-safe (ascii) media filename, keeping any extension. */
+    private function mediaSafeName(string $name): string
+    {
+        $name = trim($name);
+        if ($name === '') {
+            return '';
+        }
+        $name = (string) preg_replace('#[^A-Za-z0-9._-]+#', '-', $name);
+
+        return strtolower(trim($name, '-'));
     }
 
     /**

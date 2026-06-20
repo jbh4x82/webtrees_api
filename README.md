@@ -164,6 +164,15 @@ Every call needs `op=<operation>` plus the params below. `?` marks optional para
 | `family.addChild` | `family_xref`, `child_xref` | link an **existing** individual into a family as a child |
 | `family.delete` | `xref` | delete a family (webtrees auto-unlinks the spouses & children) |
 
+### Media
+| op | params | does |
+|---|---|---|
+| `media.create` | `title?`, (`file_url` \| `file`), `filename?`, `link_xref?` | create a media object: downloads `file_url` into the tree's media folder (server-side, follows redirects) **or** uses `file` (a name already in that folder); optionally links it to an individual/family |
+| `media.get` | `xref` | the object's files (`file`, `title`, `format`) and the records it's linked to |
+| `media.update` | `xref`, `title?`, `file_url?` | replace the title and/or the image file |
+| `media.delete` | `xref` | delete a media object (webtrees auto-unlinks it) |
+| `media.link` | `media_xref`, `xref` | link an existing media object to an individual/family |
+
 ### Edit any record (individual *or* family)
 | op | params | does |
 |---|---|---|
