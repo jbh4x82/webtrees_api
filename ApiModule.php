@@ -407,23 +407,33 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
             return $this->json(['ok' => false, 'error' => 'individual not found']);
         }
 
-        $father = null;
-        $mother = null;
-        $family = null;
+        $father   = null;
+        $mother   = null;
+        $family   = null;
+        $siblings = [];
         foreach ($indi->childFamilies() as $fam) {
             $family = $fam->xref();
             $father = $fam->husband();
             $mother = $fam->wife();
+            foreach ($fam->children() as $sib) {
+                if ($sib->xref() !== $indi->xref()) {
+                    $siblings[] = $this->personBrief($sib);
+                }
+            }
             break; // birth family
         }
 
+        // Each parent comes back "rich": their own parents (the grandparents)
+        // and every family they are a spouse in, with the spouse and children.
+        // One call gives the whole neighbourhood to climb up or sideways from.
         return $this->json([
-            'ok'     => true,
-            'op'     => 'individual.parents',
-            'xref'   => $indi->xref(),
-            'family' => $family,
-            'father' => $father instanceof Individual ? $this->personBrief($father) : null,
-            'mother' => $mother instanceof Individual ? $this->personBrief($mother) : null,
+            'ok'           => true,
+            'op'           => 'individual.parents',
+            'individual'   => $this->personBrief($indi),
+            'birth_family' => $family,
+            'father'       => $father instanceof Individual ? $this->personRich($father) : null,
+            'mother'       => $mother instanceof Individual ? $this->personRich($mother) : null,
+            'siblings'     => $siblings,
         ]);
     }
 
@@ -536,15 +546,51 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
         ];
     }
 
-    /** Extract a 4-digit year from a webtrees Date, or null if unknown. */
-    private function dateYear(\Fisharebest\Webtrees\Date $date): ?int
+    /**
+     * A person with one level of surrounding context: their own parents (so a
+     * caller can keep climbing), and each family they are a spouse in with the
+     * spouse and the children. Used to make individual.parents self-sufficient.
+     *
+     * @return array<string,mixed>
+     */
+    private function personRich(Individual $i): array
     {
-        if (!$date->isOK()) {
-            return null;
-        }
-        $year = (int) $date->minimumDate()->year;
+        $out = $this->personBrief($i);
 
-        return $year !== 0 ? $year : null;
+        $gf = null;
+        $gm = null;
+        foreach ($i->childFamilies() as $fam) {
+            $gf = $fam->husband();
+            $gm = $fam->wife();
+            break;
+        }
+        $out['parents'] = [
+            'father' => $gf instanceof Individual ? $this->personBrief($gf) : null,
+            'mother' => $gm instanceof Individual ? $this->personBrief($gm) : null,
+        ];
+
+        $families = [];
+        foreach ($i->spouseFamilies() as $fam) {
+            $spouse = null;
+            foreach ($fam->spouses() as $s) {
+                if ($s->xref() !== $i->xref()) {
+                    $spouse = $s;
+                    break;
+                }
+            }
+            $children = [];
+            foreach ($fam->children() as $child) {
+                $children[] = $this->personBrief($child);
+            }
+            $families[] = [
+                'xref'     => $fam->xref(),
+                'spouse'   => $spouse instanceof Individual ? $this->personBrief($spouse) : null,
+                'children' => $children,
+            ];
+        }
+        $out['families'] = $families;
+
+        return $out;
     }
 
     /**

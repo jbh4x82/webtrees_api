@@ -132,7 +132,7 @@ Every call needs `op=<operation>` plus the params below. `?` marks optional para
 |---|---|---|
 | `ping` | — | health check (tree + acting user) |
 | `individual.get` | `xref` | xref, name, sex, `spouse_families`, `child_families` (`families` retained = spouse only, for back-compat) |
-| `individual.parents` | `xref` | `father` + `mother` (each: xref, name, sex, `born`, `died` years) from the birth family, plus the `family` xref |
+| `individual.parents` | `xref` | rich birth-family context: `father` + `mother` **each with their own `parents` (grandparents) and every `families` entry (spouse + children)**, plus the queried `individual`, `birth_family` xref, and `siblings`. One call to navigate up or sideways. |
 | `individual.children` | `xref` | `children` across all spouse families (each tagged with its `family`) |
 | `individual.siblings` | `xref` | `siblings` (other children of the birth family), de-duplicated, self excluded |
 | `individual.spouses` | `xref` | `spouses`/partners across all spouse families |
