@@ -144,6 +144,18 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
                 case 'individual.get':
                     return $this->individualGet($tree, $params);
 
+                case 'individual.parents':
+                    return $this->individualParents($tree, $params);
+
+                case 'individual.children':
+                    return $this->individualChildren($tree, $params);
+
+                case 'individual.siblings':
+                    return $this->individualSiblings($tree, $params);
+
+                case 'individual.spouses':
+                    return $this->individualSpouses($tree, $params);
+
                 case 'individual.create':
                     return $this->individualCreate($tree, $pcs, $params);
 
@@ -375,6 +387,164 @@ class ApiModule extends AbstractModule implements ModuleCustomInterface, Request
         }
 
         return $this->json(['ok' => true, 'individual' => $this->indiInfo($indi)]);
+    }
+
+    // ──────────────────────── individual traversal (read) ────────────────────────
+    // Navigate the family graph using webtrees' own GEDCOM handling, which is
+    // pointer-format agnostic (it does NOT assume IDs look like I123/F123). Use
+    // these instead of hand-parsing GEDCOM — a tree merged from several imports
+    // can carry mixed XREFs (@36@, @F679@, @X72@) and naive regex misses them.
+
+    /**
+     * Parents of an individual, from their birth (child) family.
+     *
+     * @param array<string,mixed> $params
+     */
+    private function individualParents(Tree $tree, array $params): ResponseInterface
+    {
+        $indi = Registry::individualFactory()->make($this->clean((string) ($params['xref'] ?? '')), $tree);
+        if ($indi === null) {
+            return $this->json(['ok' => false, 'error' => 'individual not found']);
+        }
+
+        $father = null;
+        $mother = null;
+        $family = null;
+        foreach ($indi->childFamilies() as $fam) {
+            $family = $fam->xref();
+            $father = $fam->husband();
+            $mother = $fam->wife();
+            break; // birth family
+        }
+
+        return $this->json([
+            'ok'     => true,
+            'op'     => 'individual.parents',
+            'xref'   => $indi->xref(),
+            'family' => $family,
+            'father' => $father instanceof Individual ? $this->personBrief($father) : null,
+            'mother' => $mother instanceof Individual ? $this->personBrief($mother) : null,
+        ]);
+    }
+
+    /**
+     * Children of an individual across all their spouse families.
+     *
+     * @param array<string,mixed> $params
+     */
+    private function individualChildren(Tree $tree, array $params): ResponseInterface
+    {
+        $indi = Registry::individualFactory()->make($this->clean((string) ($params['xref'] ?? '')), $tree);
+        if ($indi === null) {
+            return $this->json(['ok' => false, 'error' => 'individual not found']);
+        }
+
+        $children = [];
+        foreach ($indi->spouseFamilies() as $fam) {
+            foreach ($fam->children() as $child) {
+                $children[] = $this->personBrief($child) + ['family' => $fam->xref()];
+            }
+        }
+
+        return $this->json([
+            'ok'       => true,
+            'op'       => 'individual.children',
+            'xref'     => $indi->xref(),
+            'count'    => count($children),
+            'children' => $children,
+        ]);
+    }
+
+    /**
+     * Siblings of an individual (other children of their birth family/families),
+     * de-duplicated and excluding the individual themselves.
+     *
+     * @param array<string,mixed> $params
+     */
+    private function individualSiblings(Tree $tree, array $params): ResponseInterface
+    {
+        $indi = Registry::individualFactory()->make($this->clean((string) ($params['xref'] ?? '')), $tree);
+        if ($indi === null) {
+            return $this->json(['ok' => false, 'error' => 'individual not found']);
+        }
+
+        $siblings = [];
+        $seen     = [];
+        foreach ($indi->childFamilies() as $fam) {
+            foreach ($fam->children() as $sib) {
+                if ($sib->xref() === $indi->xref() || isset($seen[$sib->xref()])) {
+                    continue;
+                }
+                $seen[$sib->xref()] = true;
+                $siblings[]         = $this->personBrief($sib) + ['family' => $fam->xref()];
+            }
+        }
+
+        return $this->json([
+            'ok'       => true,
+            'op'       => 'individual.siblings',
+            'xref'     => $indi->xref(),
+            'count'    => count($siblings),
+            'siblings' => $siblings,
+        ]);
+    }
+
+    /**
+     * Spouses/partners of an individual across all their spouse families.
+     *
+     * @param array<string,mixed> $params
+     */
+    private function individualSpouses(Tree $tree, array $params): ResponseInterface
+    {
+        $indi = Registry::individualFactory()->make($this->clean((string) ($params['xref'] ?? '')), $tree);
+        if ($indi === null) {
+            return $this->json(['ok' => false, 'error' => 'individual not found']);
+        }
+
+        $spouses = [];
+        foreach ($indi->spouseFamilies() as $fam) {
+            foreach ($fam->spouses() as $sp) {
+                if ($sp->xref() === $indi->xref()) {
+                    continue;
+                }
+                $spouses[] = $this->personBrief($sp) + ['family' => $fam->xref()];
+            }
+        }
+
+        return $this->json([
+            'ok'      => true,
+            'op'      => 'individual.spouses',
+            'xref'    => $indi->xref(),
+            'count'   => count($spouses),
+            'spouses' => $spouses,
+        ]);
+    }
+
+    /**
+     * Compact person summary used by the traversal endpoints.
+     *
+     * @return array<string,mixed>
+     */
+    private function personBrief(Individual $i): array
+    {
+        return [
+            'xref' => $i->xref(),
+            'name' => strip_tags($i->fullName()),
+            'sex'  => $i->sex(),
+            'born' => $this->dateYear($i->getBirthDate()),
+            'died' => $this->dateYear($i->getDeathDate()),
+        ];
+    }
+
+    /** Extract a 4-digit year from a webtrees Date, or null if unknown. */
+    private function dateYear(\Fisharebest\Webtrees\Date $date): ?int
+    {
+        if (!$date->isOK()) {
+            return null;
+        }
+        $year = (int) $date->minimumDate()->year;
+
+        return $year !== 0 ? $year : null;
     }
 
     /**
